@@ -384,3 +384,21 @@ License: Apache License V2.0
 License Text: Refer to previous occurrence of this license
 
 ================================================================================
+
+
+================================================================================
+
+[SoftWare] HyperParallel HyperOffload
+
+Source: https://gitcode.com/mindspore/hyper-parallel
+Issue: https://gitcode.com/mindspore/hyper-parallel/issues/211
+Imported implementation: PR 814 (278789316a91bab7ea215ead9e6236c1fd04a3e2)
+Peak residency planner: PR 986 (6b6f9df79dc22bcdf0e5e6193f1b35c78d726eed)
+Host-buffer lifetime fix: PR 1250 (60e65471715e6bb34f500291f17ccc7d576bf001)
+
+Copyright Notice: Copyright 2026 Huawei Technologies Co., Ltd
+License: Apache License, Version 2.0 (full text reproduced above).
+
+The imported source headers are retained. MindSpeed adaptations include package
+imports, opt-in feature registration, a Megatron schedule adapter, accelerator
+test setup, and independent baseline/gradient and memory measurements.

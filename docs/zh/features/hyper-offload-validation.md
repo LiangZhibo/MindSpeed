@@ -1,0 +1,60 @@
+# HyperOffload 首次移植验证记录
+
+日期：2026-10-27。基线：Ascend-TechDev/MindSpeed `core_r0.18.0`，提交
+`1135d097c6e4a3533bf4d22904b92bd904b11507`。目标：个人 fork 的 `hyperoffload` 分支。
+
+## 执行环境和结果
+
+| 验证 | 环境 | 结果 |
+| --- | --- | --- |
+| 单元测试 | Python 3.12、PyTorch 2.12.1，CPU | 264 passed |
+| 实机集成测试 | Ascend 910B3、Python 3.10.22、PyTorch 2.12.0+cpu、torch_npu 2.12.0.post2、CANN 9.1.1 | 20 passed，0 skipped |
+| 无加速器时的集成测试收集 | CPU 环境 | 20 skipped，不误报加速器验证成功 |
+| 语法与差异检查 | compileall、git diff --check | 通过 |
+
+GitHub Actions 另外配置 Python 3.10 / 3.12 与 PyTorch 2.10.0 CPU 单测，结果以 PR checks 为准。
+实机采用服务器已有的 torch / torch_npu 组合，不能据此声称已经验证目标依赖表中的全部版本组合。
+
+## 覆盖范围
+
+- 原来源实现的 API、IR、在线驱逐、两类规划器、算子 dispatch、storage 跟踪、ShadowTensor、物理缓冲及异常清理。
+- Host 缓冲在 H2D 完成前不得复用的回归用例，包含 PR 1250 的事件选择修复。
+- view、in-place、opaque region 及预 hook 替换 buffer 的数值行为。
+- 真实 D2H / H2D、warmup 和 replay 的实际峰值显存，而非只检查模拟曲线。
+- Greedy / Peak × FP32 / BF16 四种配置分别连续训练 10 步，每一步使用新输入；对比独立模型的 loss、梯度及带动量 SGD 更新后参数。
+- 连续训练测试中，Host 池在前几步后保持稳定：FP32 为 16,157,696 bytes，BF16 为 6,769,664 bytes，均低于配置的 64 MiB 上限。
+- MindSpeed 开关默认关闭、冲突参数拒绝、完整 schedule 作用域、evaluation 绕过和异常退出由单元测试验证。
+
+FP32 连续训练的数值比较容差为 rtol=1e-4、atol=1e-6；BF16 为 rtol=0.02、atol=0.002。
+
+## 部分实际显存观测
+
+下表来自相同运行中的日志，单位 MiB。基线和卸载模型使用独立参数；测量前对称清理梯度并同步设备。
+它们是测试网络的绝对 allocated 峰值，不是整卡 HBM 上限，也不代表真实大模型的收益比例。
+
+| 用例阶段 | 无卸载基线 | 卸载 | 说明 |
+| --- | ---: | ---: | --- |
+| 1024 维、4 层、batch 8192，warmup | 256.04 | 164.04 | 测试 replay 前的首次执行 |
+| 同配置，replay | 272.06 | 172.06 | 自动驻留计划执行 |
+| 512 维、3 层、batch 4096，warmup | 54.02 | 56.03 | 初始策略没有降低此阶段峰值 |
+| 同配置，replay | 58.03 | 46.02 | 规划后的峰值降低 |
+
+在线启发式不保证所有用例的首次峰值都低于无卸载基线。
+连续训练的 FP32 用例还会报告 3 MiB 激活预算低于约 6 MiB 的模拟不可卸载工作集；
+该用例验证数值正确和资源复用，不表示预算已被满足。预算警告与实际峰值必须保留和检查。
+
+## 本轮修正
+
+1. 完成包路径迁移，去掉 HyperParallel 运行依赖，保留来源版权与许可说明。
+2. 增加默认关闭的 MindSpeed 特性和完整前反向 schedule 适配。
+3. 合入 Host 池回收时优先使用 H2D 完成事件的修复。
+4. 基线模型改为深拷贝，避免来源测试复用同一组层和参数。
+5. NPU 显存统计使用 torch.npu，避免当前环境 torch.accelerator 内存接口触发 allocator 断言。
+6. 对称清理基线 / 卸载梯度，防止对照测量被另一模型的残留梯度污染。
+7. 补充输入参数检查、已知执行模式冲突检查、重复训练及 GitHub CPU 自动化。
+
+## 尚未验证
+
+本轮不包含真实 Megatron 大模型训练、FSDP / EP / PP 多卡组合、FP8 或 checkpoint 联合使用。
+CLI 包装器通过独立测试验证，但不以此代替完整 Megatron 训练验证。
+参数 / 优化器卸载、任意动态结构、多轮自动重规划及设备图捕获属于后续工作。
