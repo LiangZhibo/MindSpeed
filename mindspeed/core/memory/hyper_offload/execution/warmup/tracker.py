@@ -70,6 +70,18 @@ class ActivationTracker:
         (e.g. meta / quantized tensors that do not support
         :meth:`torch.Tensor.untyped_storage`).
         """
+        if isinstance(tensor, ShadowTensor):
+            sid = tensor.storage_id
+            physical = tensor._buffer
+            if physical.device_buffer is not None:
+                storage = physical.device_buffer.untyped_storage()
+                # H2D can replace physical storage without changing logical SID.
+                self._storage_tracker[storage] = sid
+                self._storage_sizes[sid] = max(self._storage_sizes.get(sid, 0), storage.nbytes())
+            elif physical.host_buffer is not None:
+                self._storage_sizes.setdefault(sid, physical.host_buffer.numel())
+            self._next_storage_id = max(self._next_storage_id, sid + 1)
+            return sid
         try:
             s = tensor.untyped_storage()
         except (AttributeError, RuntimeError):
@@ -82,7 +94,7 @@ class ActivationTracker:
             self._storage_tracker[s] = sid
             self._next_storage_id += 1
 
-        self._storage_sizes.setdefault(sid, s.size())
+        self._storage_sizes[sid] = max(self._storage_sizes.get(sid, 0), s.size())
         logger.debug("_ensure_id: sid=%d shape=%s", sid, tensor.shape)
         return sid
 

@@ -332,5 +332,9 @@ class BaseExecutor(ABC):
         """Reset per-cycle state before a new pass."""
         self._opaque_depth = 0
         self.op_idx = -1
+        self._last_func = None
+        self._last_args = None
+        self._last_kwargs = None
+        self._last_output_bindings = None
         self.residency_manager.clear_runtime(retained_sids=self.retained_sids)
         self._alive_shadows.clear()

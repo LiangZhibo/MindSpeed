@@ -70,6 +70,7 @@ class ShadowTensor(torch.Tensor):
     ) -> None:
         self._buffer = buffer
         self._storage_id = storage_id
+        self._metadata_error = None
         buffer.shadows.add(self)
 
     # ------------------------------------------------------------------
@@ -93,6 +94,8 @@ class ShadowTensor(torch.Tensor):
         2. Builds a fresh tensor view from the shadow's cached metadata.
         3. Returns the view — no long-lived reference is kept.
         """
+        if self._metadata_error is not None:
+            raise NotImplementedError(self._metadata_error)
         storage = self._buffer.device_storage()
         result = torch.empty(0, dtype=self.dtype, device=self.device)
         result.set_(storage, self.storage_offset(), self.size(), self.stride())
@@ -106,23 +109,55 @@ class ShadowTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
         """Dispatch a torch operation."""
         kwargs = kwargs or {}
+        resolved: dict[int, torch.Tensor] = {}
 
         def unwrap(value: Any) -> Any:
             if isinstance(value, ShadowTensor):
-                return value.resolve()
-            if isinstance(value, tuple):
-                return tuple(unwrap(v) for v in value)
-            if isinstance(value, list):
-                return [unwrap(v) for v in value]
-            if isinstance(value, dict):
-                return {k: unwrap(v) for k, v in value.items()}
+                if id(value) not in resolved:
+                    resolved[id(value)] = value.resolve()
+                return resolved[id(value)]
             return value
 
         with torch._C._DisableTorchDispatch():  # pylint: disable=protected-access
-            for tensor in mutated_tensors(func, args, kwargs):
-                if isinstance(tensor, ShadowTensor):
-                    tensor._buffer.prepare_for_write()
-            result = func(*unwrap(args), **unwrap(kwargs))
+            writes = mutated_tensors(func, args, kwargs)
+            shadow_writes = [tensor for tensor in writes if isinstance(tensor, ShadowTensor)]
+            if shadow_writes and func._schema.name in ("aten::set_", "aten::resize_", "aten::resize_as_"):
+                raise NotImplementedError(
+                    f"{func}: storage rebinding/resizing of offloaded tensors is unsupported"
+                )
+            for tensor in shadow_writes:
+                tensor._buffer.prepare_for_write()
+            result = func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs))
+            metadata_changed = any(
+                tensor.size() != resolved[id(tensor)].size()
+                or tensor.stride() != resolved[id(tensor)].stride()
+                or tensor.storage_offset() != resolved[id(tensor)].storage_offset()
+                for tensor in shadow_writes
+            )
+            for tensor in shadow_writes:
+                storage = resolved[id(tensor)].untyped_storage()
+                if storage.nbytes() != tensor._buffer.device_buffer.numel():
+                    bytes_view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+                    bytes_view.set_(storage, 0, (storage.nbytes(),), (1,))
+                    tensor._buffer.device_buffer = bytes_view
+            inplace_view = torch.Tag.inplace_view in getattr(func, "tags", ())
+            if metadata_changed and not inplace_view:
+                message = (
+                    f"{func}: implicit output storage resizing is unsupported; "
+                    "provide correctly sized out tensors and discard these outputs"
+                )
+                for tensor in shadow_writes:
+                    tensor._metadata_error = message
+                raise NotImplementedError(message)
+            if shadow_writes and inplace_view:
+                # Mirror PyTorch's wrapper-subclass metadata fixup on the meta
+                # dispatch key; replaying the data kernel would mutate twice.
+                previous = torch._C._meta_in_tls_dispatch_include()
+                torch._C._set_meta_in_tls_dispatch_include(True)
+                try:
+                    func(*args, **kwargs)
+                finally:
+                    torch._C._set_meta_in_tls_dispatch_include(previous)
             # Inside a session the executor owns output wrapping and SID lookup.
             # Outside it, preserve aliases so a later view mutation cannot bypass
             # snapshot invalidation or escape lifecycle tracking.

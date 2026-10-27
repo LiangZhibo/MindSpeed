@@ -72,6 +72,7 @@ class OffloadSession:
 
         self._dispatch_context = None
         self._session_token = None
+        self._cleanup_failed = False
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)
@@ -88,40 +89,62 @@ class OffloadSession:
 
     def __enter__(self):
         """Enter the runtime context."""
+        if _active_session.get() is not None or self._dispatch_context is not None:
+            raise RuntimeError("nested OffloadSession contexts are unsupported")
+        if self._cleanup_failed:
+            raise RuntimeError("cannot reuse OffloadSession after a cleanup failure")
         self.executor.reset()
 
+        dispatch_context = ActivationDispatchMode(self)
         self._session_token = _active_session.set(self)
-        self._dispatch_context = ActivationDispatchMode(self)
-        self._dispatch_context.__enter__()
+        try:
+            dispatch_context.__enter__()
+        except Exception:
+            _active_session.reset(self._session_token)
+            self._session_token = None
+            raise
+        self._dispatch_context = dispatch_context
         return self
+
+    def _abort(self):
+        """Preserve the original failure, attempting every cleanup operation."""
+        for cleanup in (self.residency_manager.sync_all_transfers, self.executor.reset):
+            try:
+                cleanup()
+            except Exception:
+                self._cleanup_failed = True
+                logger.exception("HyperOffload cleanup failed; discard this session")
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the runtime context."""
-        if self._dispatch_context is not None:
+        if self._dispatch_context is None:
+            raise RuntimeError("OffloadSession is not active")
+        try:
             self._dispatch_context.__exit__(exc_type, exc_val, exc_tb)
+        except Exception:
+            self._abort()
+            raise
+        finally:
             self._dispatch_context = None
-        if self._session_token is not None:
-            _active_session.reset(self._session_token)
-            self._session_token = None
+            if self._session_token is not None:
+                _active_session.reset(self._session_token)
+                self._session_token = None
 
         if exc_type is not None:
-            self.residency_manager.sync_all_transfers()
-            self.executor.reset()
+            self._abort()
             return False
 
-        self.residency_manager.wait_for_transfers()
-
-        if self.mode == "warmup":
-            trace, guide = self.executor.finish()
-            schedule = self.planner.build(trace)
-            self.executor = ReplayExecutor(self.residency_manager, schedule, guide)
-            self.mode = "replay"
-        else:
-            try:
+        try:
+            self.residency_manager.wait_for_transfers()
+            if self.mode == "warmup":
+                trace, guide = self.executor.finish()
+                schedule = self.planner.build(trace)
+                self.executor = ReplayExecutor(self.residency_manager, schedule, guide)
+                self.mode = "replay"
+            else:
                 self.executor.finish()
-            except Exception:
-                self.residency_manager.sync_all_transfers()
-                self.executor.reset()
-                raise
+        except Exception:
+            self._abort()
+            raise
 
         return False
