@@ -32,6 +32,8 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from mindspeed.core.memory.hyper_offload.execution.base import BaseExecutor
+from mindspeed.core.memory.hyper_offload.execution.schema import mutated_tensors
+from mindspeed.core.memory.hyper_offload.execution.validation import input_bindings, op_identity, signature
 from mindspeed.core.memory.hyper_offload.runtime.timer import DeviceTimer
 from mindspeed.core.memory.hyper_offload.execution.warmup.tracker import ActivationTracker
 from mindspeed.core.memory.hyper_offload.ir.replay import OpGuide
@@ -119,6 +121,9 @@ class WarmupExecutor(BaseExecutor):
                 protected_sids.add(sid)
         self._enforce_budget(protected_sids)
 
+        self._input_signature = signature((args, kwargs))
+        self._input_bindings = input_bindings(args, kwargs)
+
         self._timer.start()
 
     def on_op_end(self, result) -> Any:
@@ -132,12 +137,7 @@ class WarmupExecutor(BaseExecutor):
         op = TraceOp(name=func.__name__, duration_ms=op_duration_ms)
 
         # --- Detect mutated (write) input tensors via func._schema ---
-        mutated_tensor_ids: set[int] = set()
-        if hasattr(func, "_schema") and func._schema.is_mutable:  # pylint: disable=protected-access
-            flat_args = iter_tensors((args, {}))
-            for idx, arg_info in enumerate(func._schema.arguments):  # pylint: disable=protected-access
-                if arg_info.alias_info is not None and arg_info.alias_info.is_write and idx < len(flat_args):  # pylint: disable=protected-access
-                    mutated_tensor_ids.add(id(flat_args[idx]))
+        mutated_tensor_ids = {id(t) for t in mutated_tensors(func, args, kwargs)}
 
         seen: set[tuple[int, AccessKind]] = set()
 
@@ -175,9 +175,12 @@ class WarmupExecutor(BaseExecutor):
             output_bindings[leaf_index] = sid
 
         guide = OpGuide(
-            name=func.__name__,
+            name=op_identity(func),
             output_leaf_count=len(leaves),
             output_bindings=output_bindings,
+            input_signature=self._input_signature,
+            input_bindings=self._input_bindings,
+            output_signature=signature((args, kwargs, result), scalar_values=False),
         )
 
         self._ops.append(op)

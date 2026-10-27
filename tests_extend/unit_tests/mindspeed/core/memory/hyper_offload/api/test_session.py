@@ -124,6 +124,7 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
         # Second pass: should still have op_idx = -1 at entry
         with session:
             self.assertEqual(session.executor.op_idx, -1)
+            _ = torch.randn(4, 4) + 1
 
     def test_tensor_operation_during_session(self) -> None:
         """Simple tensor operations should work inside a session."""

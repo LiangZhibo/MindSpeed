@@ -116,5 +116,12 @@ class OffloadSession:
             schedule = self.planner.build(trace)
             self.executor = ReplayExecutor(self.residency_manager, schedule, guide)
             self.mode = "replay"
+        else:
+            try:
+                self.executor.finish()
+            except Exception:
+                self.residency_manager.sync_all_transfers()
+                self.executor.reset()
+                raise
 
         return False

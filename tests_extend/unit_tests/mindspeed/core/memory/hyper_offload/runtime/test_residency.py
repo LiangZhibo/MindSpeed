@@ -612,7 +612,7 @@ class TestResidencyManagerClearAndSync(unittest.TestCase):
             host_buffer=host, host_event=d2h_done, device_event=h2d_done
         )
         with patch.object(self.manager._host_pool, "release") as release:
-            self.manager.clear_runtime()
+            self.manager.clear_runtime(retained_sids=set())
         release.assert_called_once_with(host, event=h2d_done)
         self.assertEqual(self.manager.resident_bytes, 0)
 

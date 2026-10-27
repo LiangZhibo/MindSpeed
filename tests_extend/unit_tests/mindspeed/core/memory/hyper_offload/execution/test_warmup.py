@@ -60,7 +60,7 @@ class _FakeResidencyManager:
         self._resident[sid] = tensor.untyped_storage().size()
         return buf
 
-    def clear_runtime(self) -> None:
+    def clear_runtime(self, retained_sids=None) -> None:
         self._resident.clear()
         self.calls.clear()
 
