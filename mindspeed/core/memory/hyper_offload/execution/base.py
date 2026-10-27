@@ -167,6 +167,11 @@ class BaseExecutor(ABC):
 
         self.enter_opaque_region()
         try:
+            # Opaque functions hide their write schema. Conservatively invalidate
+            # snapshots of shadow inputs before passing raw views to the boundary.
+            for value in tree_flatten((args, kwargs))[0]:
+                if isinstance(value, ShadowTensor):
+                    value._buffer.prepare_for_write()
             self.on_op_begin(fwd_dummy, args, kwargs)
 
             # Inject a dummy tensor to ensure backward graph continuity
@@ -294,7 +299,8 @@ class BaseExecutor(ABC):
     @property
     def retained_sids(self) -> set[int]:
         """Return the set of storage IDs that still have alive shadows."""
-        return {sid for sid, shadows in self._alive_shadows.items() if shadows}
+        tracked = {sid for sid, shadows in self._alive_shadows.items() if shadows}
+        return tracked | getattr(self.residency_manager, "retained_sids", set())
 
     def make_shadow(self, storage_id: int, tensor: torch.Tensor) -> Any:
         """Register physical storage, create shadow, and track logically.
@@ -326,5 +332,5 @@ class BaseExecutor(ABC):
         """Reset per-cycle state before a new pass."""
         self._opaque_depth = 0
         self.op_idx = -1
+        self.residency_manager.clear_runtime(retained_sids=self.retained_sids)
         self._alive_shadows.clear()
-        self.residency_manager.clear_runtime()

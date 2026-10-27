@@ -23,8 +23,10 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch.utils._pytree import tree_leaves, tree_map
 
 from mindspeed.core.memory.hyper_offload.runtime.residency import PhysicalBuffer
+from mindspeed.core.memory.hyper_offload.execution.schema import mutated_tensors
 
 
 class ShadowTensor(torch.Tensor):
@@ -68,6 +70,7 @@ class ShadowTensor(torch.Tensor):
     ) -> None:
         self._buffer = buffer
         self._storage_id = storage_id
+        buffer.shadows.add(self)
 
     # ------------------------------------------------------------------
     # Public properties
@@ -116,4 +119,30 @@ class ShadowTensor(torch.Tensor):
             return value
 
         with torch._C._DisableTorchDispatch():  # pylint: disable=protected-access
-            return func(*unwrap(args), **unwrap(kwargs))
+            for tensor in mutated_tensors(func, args, kwargs):
+                if isinstance(tensor, ShadowTensor):
+                    tensor._buffer.prepare_for_write()
+            result = func(*unwrap(args), **unwrap(kwargs))
+            # Inside a session the executor owns output wrapping and SID lookup.
+            # Outside it, preserve aliases so a later view mutation cannot bypass
+            # snapshot invalidation or escape lifecycle tracking.
+            from mindspeed.core.memory.hyper_offload.api.session import OffloadSession
+            if OffloadSession.get_active() is not None:
+                return result
+            inputs = [v for v in tree_leaves((args, kwargs)) if isinstance(v, ShadowTensor)]
+            aliases = {
+                v._buffer.device_buffer.untyped_storage()._cdata: v
+                for v in inputs if v._buffer.device_buffer is not None
+            }
+
+            def wrap_alias(value):
+                if isinstance(value, torch.Tensor) and not isinstance(value, ShadowTensor):
+                    try:
+                        source = aliases.get(value.untyped_storage()._cdata)
+                    except (RuntimeError, NotImplementedError):
+                        return value
+                    if source is not None:
+                        return ShadowTensor(value, source._buffer, source.storage_id)
+                return value
+
+            return tree_map(wrap_alias, result)

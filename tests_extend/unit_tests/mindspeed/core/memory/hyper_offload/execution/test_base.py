@@ -50,7 +50,7 @@ class _FakeResidencyManager:
         self._residency[sid] = buf
         return buf
 
-    def clear_runtime(self) -> None:
+    def clear_runtime(self, retained_sids=None) -> None:
         self._residency.clear()
 
 

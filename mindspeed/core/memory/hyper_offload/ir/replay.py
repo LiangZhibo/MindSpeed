@@ -27,6 +27,7 @@ decouples the two consumers of the trace data:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -42,3 +43,6 @@ class OpGuide:
     name: str
     output_leaf_count: int = 0
     output_bindings: dict[int, int] = field(default_factory=dict)
+    input_signature: Any = None
+    output_signature: Any = None
+    input_bindings: dict[int, int] = field(default_factory=dict)

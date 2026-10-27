@@ -21,7 +21,8 @@ the control-plane (:class:`ResidencyManager`) for raw byte buffers.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, field
 
 import torch
 
@@ -56,6 +57,25 @@ class PhysicalBuffer:
 
     device_event: torch.Event | None = None
     """:class:`torch.Event` recorded after the latest H2D copy completes."""
+
+    host_pool: PinnedMemoryPool | None = None
+    """Owner of host allocations, used when a shadow is written outside a session."""
+
+    shadows: weakref.WeakSet = field(default_factory=weakref.WeakSet, repr=False, compare=False)
+    """Live aliases, including views created outside the dispatch session."""
+
+    def prepare_for_write(self) -> None:
+        """Restore device data and retire its host snapshot before a mutation."""
+        # D2H may still be reading the device storage being modified.
+        if self.host_event is not None:
+            self.host_event.synchronize()
+            self.host_event = None
+        h2d_event = self.device_event
+        self.device_storage()
+        if self.host_buffer is not None:
+            if self.host_pool is not None:
+                self.host_pool.release(self.host_buffer, event=h2d_event)
+            self.host_buffer = None
 
     # ------------------------------------------------------------------
     # Device-storage access (called by ShadowTensor)
@@ -147,6 +167,11 @@ class ResidencyManager:
             return None
         return buffer.device_buffer.numel()
 
+    @property
+    def retained_sids(self) -> set[int]:
+        """Include aliases whose wrapper was created outside executor.make_shadow."""
+        return {sid for sid, buffer in self._residency.items() if buffer.shadows}
+
     # ------------------------------------------------------------------
     # Stream synchronisation
     # ------------------------------------------------------------------
@@ -170,7 +195,7 @@ class ResidencyManager:
         it to a new :class:`~offload.execution.tensor.ShadowTensor`.
         """
         if sid not in self._residency:
-            self._residency[sid] = PhysicalBuffer()
+            self._residency[sid] = PhysicalBuffer(host_pool=self._host_pool)
         buffer = self._residency[sid]
         buffer.device = tensor.device
 
@@ -326,6 +351,12 @@ class ResidencyManager:
             buffer.device_event.synchronize()
             buffer.device_event = None
 
+        if buffer.host_buffer is None and buffer.shadows:
+            # Final-use release retires scheduler ownership. Python may keep a
+            # different set of outputs alive than it did during warmup; these
+            # shadows must continue owning their device storage until they die.
+            del self._residency[sid]
+            return
         buffer.device_buffer = None
         if buffer.host_buffer is None:
             del self._residency[sid]
@@ -343,6 +374,8 @@ class ResidencyManager:
         # Ensure any in-flight H2D copy that reads this host buffer
         # has completed before we return it to the pool.
         event_to_wait = buffer.device_event if buffer.device_event is not None else buffer.host_event
+        if buffer.device_buffer is None and buffer.shadows:
+            buffer.device_storage()
         self._host_pool.release(buffer.host_buffer, event=event_to_wait)
         buffer.host_buffer = None
         buffer.host_event = None
@@ -353,14 +386,19 @@ class ResidencyManager:
     # Runtime clear
     # ------------------------------------------------------------------
 
-    def clear_runtime(self) -> None:
-        """Release all physical resources and reset tracking."""
-        for buffer in self._residency.values():
+    def clear_runtime(self, retained_sids: set[int] | None = None) -> None:
+        """Detach live shadows onto device storage before recycling host buffers.
+
+        Executors supply their live shadow IDs; standalone callers conservatively
+        preserve all buffers. Only retained buffers are restored, so dead
+        activations do not cause a device-memory spike during cleanup.
+        """
+        for sid, buffer in self._residency.items():
+            event_to_wait = buffer.device_event if buffer.device_event is not None else buffer.host_event
+            if retained_sids is None or sid in retained_sids or buffer.shadows:
+                buffer.device_storage()
             if buffer.host_buffer is not None:
-                event_to_wait = (
-                    buffer.device_event
-                    if buffer.device_event is not None
-                    else buffer.host_event
-                )
                 self._host_pool.release(buffer.host_buffer, event=event_to_wait)
+                buffer.host_buffer = None
+                buffer.host_event = None
         self._residency.clear()

@@ -130,7 +130,7 @@ class _RecordingResidencyManager:
     def sync_all_transfers(self) -> None:
         """Match the residency manager interface for replay tests."""
 
-    def clear_runtime(self) -> None:
+    def clear_runtime(self, retained_sids=None) -> None:
         """Clear recorded residency state."""
         self._residency.clear()
 
@@ -361,6 +361,7 @@ class TestPeakSystem(unittest.TestCase):
         session.mode = "replay"
 
         x2 = torch.randn(bs, dim, device=device, requires_grad=True)
+        model.zero_grad(set_to_none=True)
         with session:
             loss2 = model(x2).sum()
             loss2.backward()

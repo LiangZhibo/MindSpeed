@@ -65,7 +65,7 @@ class _RecordingFake:
             self._residency[sid] = PhysicalBuffer(device=tensor.device)
         return self._residency[sid]
 
-    def clear_runtime(self) -> None:
+    def clear_runtime(self, retained_sids=None) -> None:
         self._residency.clear()
 
     def wait_for_transfers(self) -> None:
@@ -92,7 +92,7 @@ class TestReplayExecutor(unittest.TestCase):
         self.manager = _RecordingFake()
         self.schedule = ResidencySchedule()
         self.guide = [
-            OpGuide(name="op0", output_leaf_count=1, output_bindings={0: 10}),
+            OpGuide(name="<lambda>", output_leaf_count=1, output_bindings={0: 10}),
         ]
         self.executor = ReplayExecutor(self.manager, self.schedule, self.guide)
 
@@ -125,7 +125,7 @@ class TestReplayExecutor(unittest.TestCase):
 
     def test_guide_bound_exceeded_raises_in_on_op_begin(self) -> None:
         """When on_op_begin is called beyond guide length, it should raise."""
-        guide = [OpGuide(name="only_op", output_leaf_count=1)]
+        guide = [OpGuide(name="<lambda>", output_leaf_count=1)]
         executor = ReplayExecutor(self.manager, self.schedule, guide)
         executor.on_op_begin(lambda x: x, (), {})  # idx 0
         with self.assertRaisesRegex(RuntimeError, "replay op count exceeds warmup trace"):
@@ -221,7 +221,7 @@ class TestReplayExecutor(unittest.TestCase):
         """Output binding should use warmup leaf index for shadow creation."""
         guide = [
             OpGuide(
-                name="dummy",
+                name="<lambda>",
                 output_leaf_count=2,
                 output_bindings={1: 7},
             )
@@ -241,7 +241,7 @@ class TestReplayExecutor(unittest.TestCase):
         """copy_d2h on a storage with no physical buffer should raise RuntimeError."""
         schedule = ResidencySchedule()
         schedule.add_post(0, ResidencyActionType.COPY_D2H, 1)
-        guide = [OpGuide(name="dummy", output_leaf_count=1)]
+        guide = [OpGuide(name="<lambda>", output_leaf_count=1)]
         ex = ReplayExecutor(self.manager, schedule, guide)
 
         ex.on_op_begin(lambda: torch.randn(2), (), {})
@@ -265,7 +265,7 @@ class TestReplayExecutorWithFakeManager(unittest.TestCase):
                 self.bound.append((sid, tensor))
                 return PhysicalBuffer(device=tensor.device)
 
-            def clear_runtime(self):
+            def clear_runtime(self, retained_sids=None):
                 pass
 
             def copy_d2h(self, sid):
@@ -296,7 +296,7 @@ class TestReplayExecutorWithFakeManager(unittest.TestCase):
         manager = FakeManager()
         guide = [
             OpGuide(
-                name="dummy",
+                name="<lambda>",
                 output_leaf_count=2,
                 output_bindings={1: 7},
             )
@@ -317,11 +317,11 @@ class TestReplayExecutorWithFakeManager(unittest.TestCase):
         class FakeManager:
             """Minimal fake."""
 
-            def clear_runtime(self):
+            def clear_runtime(self, retained_sids=None):
                 pass
 
         guide = [
-            OpGuide(name="dummy", output_leaf_count=2, output_bindings={1: 7})
+            OpGuide(name="<lambda>", output_leaf_count=2, output_bindings={1: 7})
         ]
         ex = ReplayExecutor(FakeManager(), ResidencySchedule(), guide)
 

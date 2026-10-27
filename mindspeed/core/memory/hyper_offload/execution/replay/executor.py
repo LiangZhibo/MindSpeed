@@ -28,6 +28,7 @@ from typing import Any
 from torch.utils._pytree import tree_flatten
 
 from mindspeed.core.memory.hyper_offload.execution.base import BaseExecutor
+from mindspeed.core.memory.hyper_offload.execution.validation import input_bindings, op_identity, signature
 from mindspeed.core.memory.hyper_offload.ir.replay import OpGuide
 from mindspeed.core.memory.hyper_offload.ir.schedule import ResidencyActionType, ResidencySchedule
 from mindspeed.core.memory.hyper_offload.runtime.residency import ResidencyManager
@@ -67,6 +68,18 @@ class ReplayExecutor(BaseExecutor):
                 f"op={func.__name__}"
             )
 
+        guide = self._guide[self.op_idx]
+        if op_identity(func) != guide.name:
+            raise RuntimeError(
+                f"replay operator differs at op={self.op_idx}: "
+                f"expected={guide.name}, actual={op_identity(func)}"
+            )
+        if guide.input_signature is not None and (
+            signature((args, kwargs)) != guide.input_signature
+            or input_bindings(args, kwargs) != guide.input_bindings
+        ):
+            raise RuntimeError(f"replay input metadata or bindings differ at op={self.op_idx}")
+
         for action in self._schedule.pre_actions(self.op_idx):
             if action.kind == ResidencyActionType.COPY_H2D:
                 self.residency_manager.copy_h2d(action.storage_id)
@@ -101,6 +114,10 @@ class ReplayExecutor(BaseExecutor):
 
         # 1. Shadow outputs first — binds PhysicalBuffers so that
         #    post-actions can find and operate on them.
+        if op_guide.output_signature is not None and signature(
+            (self._last_args, self._last_kwargs, result), scalar_values=False
+        ) != op_guide.output_signature:
+            raise RuntimeError(f"replay output metadata or aliases differ at op={self.op_idx}")
         result = self.apply_shadows(result, op_guide.output_bindings)
 
         # 2. Execute post-actions (COPY_D2H, RELEASE_DEVICE, RELEASE_HOST).
@@ -116,3 +133,11 @@ class ReplayExecutor(BaseExecutor):
                 raise RuntimeError(f"unsupported post action {action} at op={self.op_idx}")
 
         return result
+
+    def finish(self) -> None:
+        """Reject truncated steps as well as steps with additional operations."""
+        if self.op_idx + 1 != len(self._guide):
+            raise RuntimeError(
+                f"replay op count differs from warmup trace: "
+                f"expected={len(self._guide)}, actual={self.op_idx + 1}"
+            )
