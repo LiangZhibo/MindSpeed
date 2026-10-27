@@ -51,7 +51,7 @@ class PinnedMemoryPool:
 
     def __init__(self, max_host_bytes: int) -> None:
         self._pool: dict[int, list[torch.Tensor]] = {}
-        self._pending: dict[int, list[tuple[torch.Tensor, torch.Event]]] = {}
+        self._pending: dict[int, list[tuple[torch.Tensor, torch.Event | torch.Stream]]] = {}
         self._lock = threading.Lock()
         self._total_allocated = 0
         self._max_host_bytes = max_host_bytes
@@ -81,9 +81,15 @@ class PinnedMemoryPool:
 
     def acquire(self, size: int) -> torch.Tensor:
         """Obtain a buffer of at least *size* bytes from the pool."""
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise TypeError("host allocation size must be an integer")
+        if size < 0:
+            raise ValueError("host allocation size must be nonnegative")
         bucket = _bucket_for(size)
         with self._lock:
-            for bucket_size in (bucket, *(b for b in _BUCKET_SIZES if b > bucket)):
+            candidates = sorted({bucket, *(b for b in self._pool if b >= bucket),
+                                 *(b for b in self._pending if b >= bucket)})
+            for bucket_size in candidates:
                 self._reclaim_locked(bucket_size)
                 entries = self._pool.get(bucket_size)
                 if entries:
@@ -91,6 +97,7 @@ class PinnedMemoryPool:
 
             aligned = _align_to_bucket(size)
             if self._total_allocated + aligned <= self._max_host_bytes:
+                allocation = torch.empty(aligned, dtype=torch.uint8, pin_memory=True)
                 self._total_allocated += aligned
                 logger.debug(
                     "PinnedMemoryPool: allocate %d bytes (total=%d, limit=%d)",
@@ -98,21 +105,23 @@ class PinnedMemoryPool:
                     self._total_allocated,
                     self._max_host_bytes,
                 )
-                return torch.empty(aligned, dtype=torch.uint8, pin_memory=True)[:size]
+                return allocation[:size]
 
-            self._reclaim_locked(bucket)
-            if bucket in self._pending and self._pending[bucket]:
-                tensor, event = self._pending[bucket].pop(0)
-                event.synchronize()
-                return tensor[:size]
+            for bucket_size in candidates:
+                if self._pending.get(bucket_size):
+                    tensor, event = self._pending[bucket_size][0]
+                    # Leave the entry owned by the pool if waiting fails.
+                    event.synchronize()
+                    self._pending[bucket_size].pop(0)
+                    return tensor[:size]
 
             raise RuntimeError(
                 f"PinnedMemoryPool exhausted: total_allocated={self._total_allocated}, "
                 f"max_host_bytes={self._max_host_bytes}, requested={size}"
             )
 
-    def release(self, tensor: torch.Tensor, event: torch.Event | None = None) -> None:
-        """Return a previously acquired buffer to the pool for reuse."""
+    def release(self, tensor: torch.Tensor, event: torch.Event | torch.Stream | None = None) -> None:
+        """Return a buffer, retaining its event or failed-transfer stream fence."""
         if not tensor.is_pinned():
             raise ValueError(
                 "release() expects a pinned (page-locked) tensor, "

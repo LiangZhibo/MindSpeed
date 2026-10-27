@@ -58,6 +58,9 @@ class PhysicalBuffer:
     device_event: torch.Event | None = None
     """:class:`torch.Event` recorded after the latest H2D copy completes."""
 
+    host_access_event: torch.Event | torch.Stream | None = None
+    """Latest access to the current Host allocation on the copy stream."""
+
     host_pool: PinnedMemoryPool | None = None
     """Owner of host allocations, used when a shadow is written outside a session."""
 
@@ -70,12 +73,20 @@ class PhysicalBuffer:
         if self.host_event is not None:
             self.host_event.synchronize()
             self.host_event = None
-        h2d_event = self.device_event
+        host_event = self.host_reuse_event
         self.device_storage()
         if self.host_buffer is not None:
             if self.host_pool is not None:
-                self.host_pool.release(self.host_buffer, event=h2d_event)
+                self.host_pool.release(self.host_buffer, event=host_event)
             self.host_buffer = None
+            self.host_access_event = None
+
+    @property
+    def host_reuse_event(self):
+        """Preserve access order, including a D2H following an older H2D."""
+        if self.host_access_event is not None:
+            return self.host_access_event
+        return self.device_event if self.device_event is not None else self.host_event
 
     # ------------------------------------------------------------------
     # Device-storage access (called by ShadowTensor)
@@ -113,7 +124,8 @@ class PhysicalBuffer:
             current_stream = torch.accelerator.current_stream()
             self.device_event.wait(current_stream)
             self.device_buffer.record_stream(current_stream)
-            self.device_event = None
+            # A stream wait orders consumers; it does not finish the transfer.
+            # Keep the event until Host recycling can wait for its H2D reader.
         return self.device_buffer.untyped_storage()
 
 
@@ -239,30 +251,46 @@ class ResidencyManager:
             size_bytes / 1024**2,
         )
 
+        copy_stream = self._get_copy_stream()
         # 1. Allocate pinned host buffer.
         host_buf = self._host_pool.acquire(size_bytes)
 
         # 2. Prevent the caching allocator from recycling the source
         #    memory while the copy stream reads it.
-        copy_stream = self._get_copy_stream()
-        if dev_src.device == copy_stream.device:
-            dev_src.record_stream(copy_stream)
-
-        # 3. Launch asynchronous D2H copy.
         event = None
-        if dev_src.device != copy_stream.device:
-            host_buf.copy_(dev_src, non_blocking=False)
-        else:
-            producer_stream = torch.accelerator.current_stream()
-            event = torch.Event()
-            with copy_stream:
-                copy_stream.wait_stream(producer_stream)
-                host_buf.copy_(dev_src, non_blocking=True)
-                event.record(copy_stream)
+        try:
+            if dev_src.device == copy_stream.device:
+                dev_src.record_stream(copy_stream)
+
+            # 3. Launch asynchronous D2H copy.
+            if dev_src.device != copy_stream.device:
+                host_buf.copy_(dev_src, non_blocking=False)
+            else:
+                producer_stream = torch.accelerator.current_stream()
+                event = torch.Event()
+                with copy_stream:
+                    copy_stream.wait_stream(producer_stream)
+                    host_buf.copy_(dev_src, non_blocking=True)
+                    event.record(copy_stream)
+        except Exception as transfer_error:
+            # A failed event record may follow an already enqueued copy. Only
+            # recycle after that stream is safe; failed synchronization leaves
+            # the allocation quarantined rather than reusing in-flight bytes.
+            if dev_src.device == copy_stream.device:
+                try:
+                    copy_stream.synchronize()
+                except Exception as sync_error:
+                    # Streams expose query()/synchronize() like events. A
+                    # failed drain still needs an ownership fence in the pool.
+                    self._host_pool.release(host_buf, event=copy_stream)
+                    raise transfer_error from sync_error
+            self._host_pool.release(host_buf)
+            raise
 
         # 4. Update physical buffer.
         buffer.host_buffer = host_buf
         buffer.host_event = event
+        buffer.host_access_event = event
 
         logger.debug("copy_d2h sid=%d: done", sid)
 
@@ -313,23 +341,32 @@ class ResidencyManager:
         # 2. Launch async H2D copy (wait for prior D2H event if present).
         copy_stream = self._get_copy_stream()
         event = None
-        if dev_bytes.device != copy_stream.device:
-            dev_bytes.copy_(buffer.host_buffer, non_blocking=False)
-        else:
-            producer_stream = torch.accelerator.current_stream()
-            event = torch.Event()
-            with copy_stream:
-                copy_stream.wait_stream(producer_stream)
-                if buffer.host_event is not None:
-                    buffer.host_event.wait(copy_stream)
-                dev_bytes.copy_(buffer.host_buffer, non_blocking=True)
-                event.record(copy_stream)
+        try:
+            if dev_bytes.device != copy_stream.device:
+                dev_bytes.copy_(buffer.host_buffer, non_blocking=False)
+            else:
+                dev_bytes.record_stream(copy_stream)
+                producer_stream = torch.accelerator.current_stream()
+                event = torch.Event()
+                with copy_stream:
+                    copy_stream.wait_stream(producer_stream)
+                    if buffer.host_event is not None:
+                        buffer.host_event.wait(copy_stream)
+                    dev_bytes.copy_(buffer.host_buffer, non_blocking=True)
+                    event.record(copy_stream)
+        except Exception as transfer_error:
+            if dev_bytes.device == copy_stream.device:
+                buffer.host_access_event = copy_stream
+                try:
+                    copy_stream.synchronize()
+                except Exception as sync_error:
+                    raise transfer_error from sync_error
+            raise
 
         # 3. Update physical buffer.
-        if dev_bytes.device == copy_stream.device:
-            dev_bytes.record_stream(copy_stream)
         buffer.device_buffer = dev_bytes
         buffer.device_event = event
+        buffer.host_access_event = event
 
     # ------------------------------------------------------------------
     # Release helpers
@@ -373,12 +410,13 @@ class ResidencyManager:
 
         # Ensure any in-flight H2D copy that reads this host buffer
         # has completed before we return it to the pool.
-        event_to_wait = buffer.device_event if buffer.device_event is not None else buffer.host_event
+        event_to_wait = buffer.host_reuse_event
         if buffer.device_buffer is None and buffer.shadows:
             buffer.device_storage()
         self._host_pool.release(buffer.host_buffer, event=event_to_wait)
         buffer.host_buffer = None
         buffer.host_event = None
+        buffer.host_access_event = None
         if buffer.device_buffer is None:
             del self._residency[sid]
 
@@ -394,11 +432,12 @@ class ResidencyManager:
         activations do not cause a device-memory spike during cleanup.
         """
         for sid, buffer in self._residency.items():
-            event_to_wait = buffer.device_event if buffer.device_event is not None else buffer.host_event
+            event_to_wait = buffer.host_reuse_event
             if retained_sids is None or sid in retained_sids or buffer.shadows:
                 buffer.device_storage()
             if buffer.host_buffer is not None:
                 self._host_pool.release(buffer.host_buffer, event=event_to_wait)
                 buffer.host_buffer = None
                 buffer.host_event = None
+                buffer.host_access_event = None
         self._residency.clear()

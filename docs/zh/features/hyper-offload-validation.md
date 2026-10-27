@@ -76,3 +76,25 @@ CLI 包装器通过独立测试验证，但不以此代替完整 Megatron 训练
 
 保留输出的设备内存以及写入保护引入的同步属于正确性成本，本轮没有验证吞吐性能。
 本轮也不扩展此前未验证的 Megatron / FSDP / EP / PP、大模型及重计算组合范围。
+
+## 基础原子功能扩展回归
+
+本轮在上一轮 291 CPU / 32 NPU 用例基础上，新增 63 CPU / 37 NPU 用例。
+最终 CPU 354 passed；Ascend 910B3 69 passed、0 skipped，实机使用空闲物理卡 1。
+首批 47 个定向用例在修复前为 22 failed、25 passed，剩余用例在定位过程中继续补入。
+
+| 原子范围 | 验证与修复 |
+| --- | --- |
+| 原始字节及 view | FP32 / FP16 / BF16 / INT64，标量、空切片、非零 offset、转置、零 stride expand、步进切片；每种连续搬入搬出三次 |
+| 原地元数据 | 修复 transpose_ / t_ / squeeze_ / unsqueeze_ / as_strided_ 后包装元数据未更新；NPU 同时比较三轮前反向与原生梯度 |
+| storage 身份 | Shadow 使用逻辑 ID，并把 H2D 后的新物理 storage 重新映射到同一 ID；view / slice 不再错误地产生新 ID；大小按观测最大值记录 |
+| Host 分配与等待 | 分配成功后再增加计数；预算满时可等待较大 bucket；等待失败保留池所有权；覆盖非法 size 与超出标准 bucket 的复用 |
+| 传输事件 | 计算流 wait 不清除 H2D 完成事件；按当前 Host 分配的最近访问保护回收，覆盖旧 H2D 后又有新 D2H 的顺序 |
+| 故障回收 | 注入分配、复制、event record、stream drain 失败；未完成复制不得失去 Host 所有权，必要时以整个拷贝流作为回收 fence |
+| 会话状态 | 拒绝嵌套 / 重入；进入、退出、等待、profile、planner 异常后恢复；清理失败不掩盖原异常且禁止复用；reset 释放缓存输入 |
+| 不支持的 storage 改动 | 显式拒绝 set_ / resize_ / resize_as_；自动扩容的 out= 报错且禁止继续读取，覆盖空输出和多输出 |
+| 引用寿命 | 新增禁用循环 GC 的测试，确保解析出的原始 view 在 dispatch 返回后释放；已移除缓存递归闭包的引用环 |
+
+原有实际显存下降断言、Greedy / Peak × FP32 / BF16 连续十步训练及参数 / 梯度比较均继续通过，
+没有放宽显存或数值断言。扩容 out= 的保护属于明确拒绝不支持行为，不表示已经支持动态 storage 改容。
+本轮没有扩展到真实 Megatron / FSDP 大模型、多卡、重计算组合或吞吐性能验证。
