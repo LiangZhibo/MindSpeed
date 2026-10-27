@@ -69,6 +69,7 @@ from mindspeed.features_manager.pipeline_parallel.dualpipev_feature import Dualp
 from mindspeed.features_manager.memory.reuse_fp32_param import ReuseFP32Param
 from mindspeed.features_manager.memory.smart_swap import SmartSwapFeature
 from mindspeed.features_manager.memory.swap_layer_input import SwapLayerInputFeature
+from mindspeed.features_manager.memory.hyper_offload import HyperOffloadFeature
 
 from mindspeed.features_manager.dist_train.dist_train_feature import DistTrainFeature
 
@@ -355,6 +356,7 @@ def add_transformer_engine_features(features_list: List[MindSpeedFeature]):
 
 def create_features_list():
     features_list = []
+    features_list.append(HyperOffloadFeature())
     add_basic_optimizer_features(features_list)
     add_context_parallel_features(features_list)
     add_data_parallel_features(features_list)
