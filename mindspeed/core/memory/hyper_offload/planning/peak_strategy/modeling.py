@@ -42,8 +42,7 @@ def build_profile_and_candidates(
     accesses_by_storage: dict[int, list[StorageAccess]],
 ) -> ProfileAndCandidates:
     """Build the resident-memory profile and all evictable candidates."""
-    max_op_id = max((access.op_id for op in trace.ops for access in op.accesses), default=-1)
-    resident_bytes = [0] * (max_op_id + 1 if max_op_id >= 0 else 0)
+    resident_bytes = [0] * len(trace.ops)
     edge_bytes = [0] * max(0, len(resident_bytes) - 1)
     candidates: list[PeakCandidate] = []
     boundary_candidates: list[PeakCandidate] = []
@@ -57,6 +56,8 @@ def build_profile_and_candidates(
         ordered = sorted(accesses, key=lambda access: access.op_id)
         first_op_id = ordered[0].op_id
         last_op_id = extend_last_use_for_alias_ops(trace, sid, ordered[-1].op_id)
+        if sid in trace.retained_sids:
+            last_op_id = len(trace.ops) - 1
         if first_op_id > last_op_id:
             continue
 

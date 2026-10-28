@@ -61,8 +61,12 @@ class PhysicalBuffer:
     host_access_event: torch.Event | torch.Stream | None = None
     """Latest access to the current Host allocation on the copy stream."""
 
-    host_pool: PinnedMemoryPool | None = None
-    """Owner of host allocations, used when a shadow is written outside a session."""
+    host_pool_ref: weakref.ReferenceType | None = None
+    """Do not retain a session's entire cache through one surviving output."""
+
+    @property
+    def host_pool(self):
+        return self.host_pool_ref() if self.host_pool_ref is not None else None
 
     shadows: weakref.WeakSet = field(default_factory=weakref.WeakSet, repr=False, compare=False)
     """Live aliases, including views created outside the dispatch session."""
@@ -76,8 +80,9 @@ class PhysicalBuffer:
         host_event = self.host_reuse_event
         self.device_storage()
         if self.host_buffer is not None:
-            if self.host_pool is not None:
-                self.host_pool.release(self.host_buffer, event=host_event)
+            pool = self.host_pool
+            if pool is not None:
+                pool.release(self.host_buffer, event=host_event)
             self.host_buffer = None
             self.host_access_event = None
 
@@ -206,14 +211,21 @@ class ResidencyManager:
         Returns the :class:`PhysicalBuffer` so that the caller can pass
         it to a new :class:`~offload.execution.tensor.ShadowTensor`.
         """
-        if sid not in self._residency:
-            self._residency[sid] = PhysicalBuffer(host_pool=self._host_pool)
-        buffer = self._residency[sid]
-        buffer.device = tensor.device
-
         storage = tensor.untyped_storage()
         dev_view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
         dev_view.set_(storage, 0, (storage.size(),), (1,))
+        if sid not in self._residency:
+            self._residency[sid] = PhysicalBuffer(host_pool_ref=weakref.ref(self._host_pool))
+        buffer = self._residency[sid]
+        old_storage = buffer.device_buffer.untyped_storage() if buffer.device_buffer is not None else None
+        if old_storage is None or old_storage._cdata != storage._cdata:
+            if buffer.host_buffer is not None:
+                self._host_pool.release(buffer.host_buffer, event=buffer.host_reuse_event)
+            buffer.host_buffer = None
+            buffer.host_event = None
+            buffer.host_access_event = None
+            buffer.device_event = None
+        buffer.device = tensor.device
         buffer.device_buffer = dev_view
         return buffer
 

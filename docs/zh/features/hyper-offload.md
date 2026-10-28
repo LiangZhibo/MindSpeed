@@ -57,6 +57,8 @@ for batch in loader:
 
 同一个 session 应覆盖相同范围的完整前反向，并跨训练迭代复用。优化器更新放在 context 外。
 API 的默认规划器仍为 GreedyResidencyPlanner，以保持来源实现的行为；需要峰值规划时显式传入。
+`skip_offload` 支持 partial、callable 对象及 nn.Module，并保留非可导输出和未使用梯度的原生语义。
+其 backward 必须在创建该区域的同一次 session 内完成；不同 session 的 ShadowTensor 应先在会话外克隆。
 
 ## MindSpeed / Megatron 接入
 
@@ -73,7 +75,8 @@ API 的默认规划器仍为 GreedyResidencyPlanner，以保持来源实现的�
 特性通过 MindSpeedPatchesManager 包装 `megatron.training.training.get_forward_backward_func`。
 一次 context 覆盖完整 schedule 的所有 microbatch 和 backward；不把每层或每个 microbatch
 分别视为完整 step。evaluation / forward_only 调用直接执行原 schedule，不改变训练 session 的阶段。
-该接入不捕获 optimizer.step，也不卸载其状态。
+该接入不捕获 optimizer.step，也不卸载其状态。同一 factory 返回相同训练函数、配置不变时复用原 wrapper/session，
+重复查询不会每步重新 warmup；配置或训练函数变化时创建新 wrapper。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -126,3 +129,5 @@ ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest tests_extend/system_tests/hyper_off
 - [PR 1250](https://gitcode.com/mindspore/hyper-parallel/pull/1250)：Host 缓冲回收事件修复
 
 具体来源提交与新增的 MindSpeed 适配范围见模块 README 和 Third_Party_Open_Source_Software_Notice。
+
+完整组件覆盖与当前环境限制见[全组件调查报告](hyper-offload-component-audit.md)。

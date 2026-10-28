@@ -79,6 +79,7 @@ class GreedyResidencyPlanner:
         Returns:
             A :class:`ResidencySchedule` with pre/post eviction actions.
         """
+        trace = trace.validate()
         schedule = ResidencySchedule()
         limit = trace.memory_limit_bytes if trace.memory_limit_bytes is not None else float("inf")
         if not trace.ops or limit == float("inf"):
@@ -138,11 +139,7 @@ class GreedyResidencyPlanner:
             *candidates* are sorted for greedy selection, and
             *releasable* maps each storage id to its last access.
         """
-        max_op_id = max(
-            (access.op_id for op in trace.ops for access in op.accesses),
-            default=0,
-        )
-        resident_bytes = [0] * (max_op_id + 1)
+        resident_bytes = [0] * len(trace.ops)
         unsorted_candidates: list[_EvictionCandidate] = []
         releasable: dict[int, StorageAccess] = {}
 
@@ -152,7 +149,8 @@ class GreedyResidencyPlanner:
                 continue
 
             footprint = cls._process_storage_accesses(sid, size_bytes, accesses)
-            for op_id in range(footprint.first_op_id, footprint.last_op_id + 1):
+            last_resident_op = len(trace.ops) - 1 if sid in trace.retained_sids else footprint.last_op_id
+            for op_id in range(footprint.first_op_id, last_resident_op + 1):
                 resident_bytes[op_id] += size_bytes
 
             releasable[sid] = footprint.last_access

@@ -66,15 +66,14 @@ class TestGreedyResidencyPlanner(unittest.TestCase):
         self.assertEqual(len(sched.pre), 0)
         self.assertEqual(len(sched.post), 0)
 
-    def test_trace_with_no_storage_sizes_returns_empty_schedule(self) -> None:
-        """When no storage sizes are provided, no eviction should be scheduled."""
+    def test_trace_with_missing_storage_sizes_is_rejected(self) -> None:
+        """Missing sizes for accessed storage must fail before planning."""
         trace = _make_trace(
             [TraceOp(name="op", accesses=[StorageAccess(0, 1, AccessKind.WRITE)])],
             memory_limit_bytes=1,
         )
-        sched = self.planner.build(trace)
-        self.assertEqual(len(sched.pre), 0)
-        self.assertEqual(len(sched.post), 0)
+        with self.assertRaisesRegex(ValueError, "storage size missing"):
+            self.planner.build(trace)
 
     def test_infinite_memory_limit_returns_empty_schedule(self) -> None:
         """With no memory limit (None), no eviction actions should be emitted."""

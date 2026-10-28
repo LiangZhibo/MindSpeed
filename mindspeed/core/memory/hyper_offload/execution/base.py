@@ -42,12 +42,15 @@ class OpaqueRegionStart(torch.autograd.Function):
         """Forward pass for the start boundary."""
         ctx.executor = executor
         ctx.func_name = func_name
+        ctx.generation = executor._generation
+        ctx.set_materialize_grads(False)
         return (dummy,) + inputs
 
     @staticmethod
     def backward(ctx: Any, grad_dummy: Any, *grad_inputs: Any) -> Any:  # pylint: disable=unused-argument
         """Backward pass for the start boundary."""
         executor = ctx.executor
+        executor.check_opaque_scope(ctx.generation)
         executor.exit_opaque_region()
 
         # Reconstruct the backward op using on_op_end.
@@ -76,16 +79,26 @@ class OpaqueRegionEnd(torch.autograd.Function):
         """
         ctx.executor = executor
         ctx.func_name = func_name
+        ctx.generation = executor._generation
+        ctx.set_materialize_grads(False)
         # 'outputs' is a flat tuple of tensors passed via .apply(*flat_res).
         # on_op_end has already been called and cached output_bindings
         # via apply_shadows; use them to avoid a redundant traversal.
         # pylint: disable=protected-access
-        return tuple(executor.apply_shadows(outputs, executor._last_output_bindings))
+        wrapped = tuple(executor.apply_shadows(outputs, executor._last_output_bindings))
+        non_differentiable = [
+            value for original, value in zip(outputs, wrapped)
+            if isinstance(original, torch.Tensor) and not original.requires_grad
+        ]
+        if non_differentiable:
+            ctx.mark_non_differentiable(*non_differentiable)
+        return wrapped
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
         """Backward pass for the end boundary."""
         executor = ctx.executor
+        executor.check_opaque_scope(ctx.generation)
 
         def bwd_dummy(*_args: Any, **_kwargs: Any) -> Any:
             """Dummy backward function that records the op boundary."""
@@ -115,6 +128,8 @@ class BaseExecutor(ABC):
         self._alive_shadows: dict[int, weakref.WeakSet[ShadowTensor]] = defaultdict(weakref.WeakSet)
         self.op_idx: int = -1
         self._opaque_depth: int = 0
+        self._generation = 0
+        self._session_active = False
 
         # Cached by on_op_begin for use in on_op_end.
         self._last_func = None
@@ -134,7 +149,14 @@ class BaseExecutor(ABC):
 
     def exit_opaque_region(self) -> None:
         """Exit an opaque region."""
+        if self._opaque_depth <= 0:
+            raise RuntimeError("opaque region depth underflow")
         self._opaque_depth -= 1
+
+    def check_opaque_scope(self, generation):
+        """Autograd workers must use the originating active session generation."""
+        if not self._session_active or self._generation != generation:
+            raise RuntimeError("opaque backward must run inside its originating session scope")
 
     def execute_opaque_op(self, func_name: str, fn: Callable, args: tuple, kwargs: dict) -> Any:
         """Execute a function as a single virtual op.
@@ -159,6 +181,7 @@ class BaseExecutor(ABC):
         """
         if self.in_opaque_region:
             return fn(*args, **kwargs)
+        self._validate_input_ownership(args, kwargs)
 
         def fwd_dummy(*_a: Any, **_kw: Any) -> Any:
             """Dummy forward function that records the op boundary."""
@@ -240,10 +263,22 @@ class BaseExecutor(ABC):
         override this method **must** call ``super().on_op_begin(...)``
         to maintain the cache.
         """
+        self._validate_input_ownership(args, kwargs)
         self._last_func = func
         self._last_args = args
         self._last_kwargs = kwargs
         self.op_idx += 1
+
+    def _validate_input_ownership(self, args, kwargs):
+        """Foreign logical IDs must not enter another session's residency plan."""
+        pool = getattr(self.residency_manager, "_host_pool", None)
+        if pool is None:
+            return
+        for tensor in tree_flatten((args, kwargs))[0]:
+            if isinstance(tensor, ShadowTensor) and tensor._buffer.host_pool is not pool:
+                raise RuntimeError(
+                    "foreign ShadowTensor belongs to another session; clone it outside the session first"
+                )
 
     @abstractmethod
     def on_op_end(self, result) -> Any:
@@ -283,6 +318,7 @@ class BaseExecutor(ABC):
             tensors replaced by :class:`ShadowTensor`.
 
         """
+        self._validate_input_ownership((result,), {})
         leaves, tree_spec = tree_flatten(result)
         shadowed = list(leaves)
         for idx, leaf in enumerate(leaves):
@@ -330,6 +366,8 @@ class BaseExecutor(ABC):
 
     def reset(self) -> None:
         """Reset per-cycle state before a new pass."""
+        self._generation += 1
+        self._session_active = False
         self._opaque_depth = 0
         self.op_idx = -1
         self._last_func = None

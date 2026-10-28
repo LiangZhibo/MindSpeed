@@ -47,6 +47,8 @@ def skip_offload(fn: F) -> F:
         if session is None:
             return fn(*args, **kwargs)
 
-        return session.executor.execute_opaque_op(fn.__name__, fn, args, kwargs)
+        target = fn.func if isinstance(fn, functools.partial) else fn
+        name = getattr(target, "__qualname__", type(target).__qualname__)
+        return session.executor.execute_opaque_op(name, fn, args, kwargs)
 
     return wrapper
