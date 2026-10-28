@@ -24,8 +24,8 @@ class HyperOffloadFeature(MindSpeedFeature):
         if args.hyper_offload_communication_masking and args.hyper_offload_planner != "peak":
             raise ValueError("HyperOffload communication masking requires the peak planner")
         graph_enabled = (
-            getattr(args, "cuda_graph_impl", "none") != "none"
-            or getattr(args, "npu_graph_mode", "none") != "none"
+            getattr(args, "cuda_graph_impl", "none") not in (None, False, "none")
+            or getattr(args, "npu_graph_mode", "none") not in (None, False, "none")
             or any(getattr(args, key, False) for key in (
                 "optimizer_cuda_graph", "enable_cuda_graph", "external_cuda_graph"
             ))

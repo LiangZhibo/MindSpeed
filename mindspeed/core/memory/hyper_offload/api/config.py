@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import operator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -40,6 +41,14 @@ class OffloadConfig:
     planner: ResidencyPlanner | None = None
 
     def __post_init__(self):
+        for name in ("max_resident_activation_mb", "max_offload_activation_mb"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise TypeError(f"{name} must be integer MiB")
+            try:
+                setattr(self, name, operator.index(value))
+            except TypeError as error:
+                raise TypeError(f"{name} must be integer MiB") from error
         if self.max_resident_activation_mb < 0:
             raise ValueError("max_resident_activation_mb must be nonnegative")
         if self.max_offload_activation_mb <= 0:

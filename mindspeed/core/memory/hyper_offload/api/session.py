@@ -104,6 +104,7 @@ class OffloadSession:
             self._session_token = None
             raise
         self._dispatch_context = dispatch_context
+        self.executor._session_active = True
         return self
 
     def _abort(self):
@@ -119,6 +120,7 @@ class OffloadSession:
         """Exit the runtime context."""
         if self._dispatch_context is None:
             raise RuntimeError("OffloadSession is not active")
+        self.executor._session_active = False
         try:
             self._dispatch_context.__exit__(exc_type, exc_val, exc_tb)
         except Exception:

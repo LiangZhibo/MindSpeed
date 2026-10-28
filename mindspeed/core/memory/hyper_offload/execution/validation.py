@@ -52,6 +52,7 @@ def signature(value, scalar_values=True):
             "tensor", tuple(leaf.shape), leaf.dtype, leaf.device, leaf.layout,
             tuple(leaf.stride()) if strided else None,
             leaf.storage_offset() if strided else None, storage_bytes, alias,
+            leaf.is_conj(), leaf.is_neg(),
         ))
     return spec, tuple(metadata)
 

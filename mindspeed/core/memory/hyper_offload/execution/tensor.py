@@ -51,7 +51,7 @@ class ShadowTensor(torch.Tensor):
         storage_id: int,
     ) -> ShadowTensor:
         """Create a new instance using *elem*'s metadata."""
-        return torch.Tensor._make_wrapper_subclass(
+        result = torch.Tensor._make_wrapper_subclass(
             cls,
             elem.size(),
             strides=elem.stride(),
@@ -61,6 +61,9 @@ class ShadowTensor(torch.Tensor):
             device=elem.device,
             requires_grad=elem.requires_grad,
         )
+        torch._C._set_conj(result, elem.is_conj())
+        torch._C._set_neg(result, elem.is_neg())
+        return result
 
     def __init__(  # pylint: disable=unused-argument
         self,
@@ -99,6 +102,8 @@ class ShadowTensor(torch.Tensor):
         storage = self._buffer.device_storage()
         result = torch.empty(0, dtype=self.dtype, device=self.device)
         result.set_(storage, self.storage_offset(), self.size(), self.stride())
+        torch._C._set_conj(result, self.is_conj())
+        torch._C._set_neg(result, self.is_neg())
         return result
 
     # ------------------------------------------------------------------

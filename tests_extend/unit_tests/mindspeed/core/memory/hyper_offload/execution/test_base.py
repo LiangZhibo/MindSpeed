@@ -111,10 +111,13 @@ class TestBaseExecutor(unittest.TestCase):
         self.assertEqual(self.executor._opaque_depth, 0)
         self.assertFalse(self.executor.in_opaque_region)
 
-    def test_exit_opaque_region_below_zero_does_not_raise(self) -> None:
-        """Calling exit_opaque_region when not in region should not crash."""
-        self.executor.exit_opaque_region()
-        self.assertEqual(self.executor._opaque_depth, -1)
+    def test_exit_opaque_region_rejects_underflow_without_corrupting_state(self) -> None:
+        """An unbalanced exit must not make the next entry look inactive."""
+        with self.assertRaisesRegex(RuntimeError, "underflow"):
+            self.executor.exit_opaque_region()
+        self.assertEqual(self.executor._opaque_depth, 0)
+        self.executor.enter_opaque_region()
+        self.assertTrue(self.executor.in_opaque_region)
 
     def test_retained_sids_empty_initially(self) -> None:
         self.assertEqual(self.executor.retained_sids, set())

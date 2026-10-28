@@ -46,6 +46,8 @@ class DeviceTimer:
         Raises:
             RuntimeError: If no accelerator is available.
         """
+        if self._start_event is not None:
+            raise RuntimeError("DeviceTimer measurement is already active")
         if not torch.accelerator.is_available():
             raise RuntimeError(
                 "Cannot start DeviceTimer: no accelerator available"
@@ -65,13 +67,17 @@ class DeviceTimer:
             raise RuntimeError(
                 "Cannot stop DeviceTimer: start() was not called"
             )
-        if not torch.accelerator.is_available():
-            raise RuntimeError(
-                "Cannot stop DeviceTimer: no accelerator available"
-            )
-        end_event = torch.Event(enable_timing=True)
-        end_event.record(torch.accelerator.current_stream())
-        end_event.synchronize()
-        duration_ms = self._start_event.elapsed_time(end_event)
+        start_event = self._start_event
+        try:
+            if not torch.accelerator.is_available():
+                raise RuntimeError("Cannot stop DeviceTimer: no accelerator available")
+            end_event = torch.Event(enable_timing=True)
+            end_event.record(torch.accelerator.current_stream())
+            end_event.synchronize()
+            return start_event.elapsed_time(end_event)
+        finally:
+            self.reset()
+
+    def reset(self) -> None:
+        """Discard an aborted measurement without reusing its timestamp."""
         self._start_event = None
-        return duration_ms

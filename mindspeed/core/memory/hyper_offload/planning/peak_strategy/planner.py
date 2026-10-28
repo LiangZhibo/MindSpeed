@@ -21,6 +21,7 @@ are materialized as copy, release, and prefetch actions for replay.
 """
 
 from __future__ import annotations
+import math
 
 from mindspeed.core.memory.hyper_offload.ir.schedule import ResidencySchedule
 from mindspeed.core.memory.hyper_offload.ir.trace import ActivationTrace
@@ -46,7 +47,11 @@ class PeakResidencyPlanner:
         enable_communication_masking: bool = False,
         **score_weights: float,
     ) -> None:
+        if weights is not None and score_weights:
+            raise TypeError("provide weights or score weight keywords, not both")
         self._weights = weights or self._parse_score_weights(score_weights)
+        if not all(math.isfinite(value) for value in vars(self._weights).values()):
+            raise ValueError("peak score weights must be finite")
         self._enable_communication_masking = enable_communication_masking
 
     @staticmethod
@@ -70,6 +75,7 @@ class PeakResidencyPlanner:
 
     def build(self, trace: ActivationTrace) -> ResidencySchedule:
         """Build a residency schedule from a captured activation trace."""
+        trace = trace.validate()
         limit = trace.memory_limit_bytes if trace.memory_limit_bytes is not None else float("inf")
         if not trace.ops or limit == float("inf"):
             return ResidencySchedule()

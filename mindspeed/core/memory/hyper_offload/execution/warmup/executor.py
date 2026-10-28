@@ -211,4 +211,5 @@ class WarmupExecutor(BaseExecutor):
         self._ops = []
         self._guide = []
         self._tracker.clear_activations()
+        self._timer.reset()
         super().reset()

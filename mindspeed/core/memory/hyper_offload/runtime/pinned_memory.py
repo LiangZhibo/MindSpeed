@@ -55,6 +55,13 @@ class PinnedMemoryPool:
         self._lock = threading.Lock()
         self._total_allocated = 0
         self._max_host_bytes = max_host_bytes
+        self._owned_storages = {}
+        self._leased = set()
+
+    def _lease(self, tensor, size):
+        """Called under the lock when ownership passes to a borrower."""
+        self._leased.add(tensor.untyped_storage()._cdata)
+        return tensor[:size]
 
     @property
     def total_allocated(self) -> int:
@@ -93,11 +100,13 @@ class PinnedMemoryPool:
                 self._reclaim_locked(bucket_size)
                 entries = self._pool.get(bucket_size)
                 if entries:
-                    return entries.pop()[:size]
+                    return self._lease(entries.pop(), size)
 
             aligned = _align_to_bucket(size)
             if self._total_allocated + aligned <= self._max_host_bytes:
                 allocation = torch.empty(aligned, dtype=torch.uint8, pin_memory=True)
+                storage = allocation.untyped_storage()
+                self._owned_storages[storage._cdata] = storage
                 self._total_allocated += aligned
                 logger.debug(
                     "PinnedMemoryPool: allocate %d bytes (total=%d, limit=%d)",
@@ -105,7 +114,7 @@ class PinnedMemoryPool:
                     self._total_allocated,
                     self._max_host_bytes,
                 )
-                return allocation[:size]
+                return self._lease(allocation, size)
 
             for bucket_size in candidates:
                 if self._pending.get(bucket_size):
@@ -113,7 +122,7 @@ class PinnedMemoryPool:
                     # Leave the entry owned by the pool if waiting fails.
                     event.synchronize()
                     self._pending[bucket_size].pop(0)
-                    return tensor[:size]
+                    return self._lease(tensor, size)
 
             raise RuntimeError(
                 f"PinnedMemoryPool exhausted: total_allocated={self._total_allocated}, "
@@ -134,6 +143,12 @@ class PinnedMemoryPool:
 
         bucket = _bucket_for(full_tensor.numel())
         with self._lock:
+            identity = storage._cdata
+            if identity not in self._owned_storages:
+                raise ValueError("release() storage is not owned by this Host pool")
+            if identity not in self._leased:
+                raise ValueError("release() storage is not leased or was already released")
+            self._leased.remove(identity)
             if event is not None:
                 self._pending.setdefault(bucket, []).append((full_tensor, event))
             else:
