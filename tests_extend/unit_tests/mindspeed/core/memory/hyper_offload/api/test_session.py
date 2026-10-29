@@ -22,6 +22,7 @@ from unittest.mock import patch
 import torch
 
 from mindspeed.core.memory.hyper_offload import OffloadConfig, OffloadSession
+from mindspeed.core.memory.hyper_offload.api.session import ActivationDispatchMode
 from mindspeed.core.memory.hyper_offload.execution.replay import ReplayExecutor
 from mindspeed.core.memory.hyper_offload.execution.warmup import WarmupExecutor
 
@@ -97,6 +98,17 @@ class TestOffloadSessionLifecycle(unittest.TestCase):
         with OffloadSession(config) as sess:
             self.assertIsInstance(sess, OffloadSession)
             self.assertEqual(sess.mode, "warmup")
+
+    def test_fsdp_internal_ops_skip_activation_executor(self) -> None:
+        session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))
+        dispatch_mode = ActivationDispatchMode(session)
+        lhs = torch.tensor([1.0])
+        rhs = torch.tensor([2.0])
+        with patch("mindspeed.core.memory.hyper_offload.api.session._inside_fsdp_internal", return_value=True):
+            with patch.object(session.executor, "dispatch") as dispatch:
+                result = dispatch_mode.__torch_dispatch__(torch.ops.aten.add.Tensor, (), (lhs, rhs), {})
+        torch.testing.assert_close(result, torch.tensor([3.0]))
+        dispatch.assert_not_called()
 
     def test_warmup_creates_warmup_executor(self) -> None:
         """During warmup, the executor should be a WarmupExecutor."""

@@ -62,10 +62,37 @@ class TestBucketHelpers(unittest.TestCase):
         self.assertEqual(_bucket_for(2**20), 2**20)
         self.assertEqual(_bucket_for(2**20 + 1), 2**21)
 
+    def test_large_activation_uses_tight_bucket(self) -> None:
+        self.assertEqual(_bucket_for(4 * 2**20 + 1), 6 * 2**20)
+        self.assertEqual(_bucket_for(129 * 2**20), 130 * 2**20)
+
     def test_bucket_for_oversize(self) -> None:
         """Size > largest bucket (2^31) returns the size itself (fallback in _align_to_bucket)."""
         self.assertEqual(_bucket_for(2**32), 2**32)
         self.assertEqual(_bucket_for(2**40), 2**40)
+
+
+class TestPageableFallback(unittest.TestCase):
+    """Keep owned buffers reusable when the pinned allocator is exhausted."""
+
+    def test_pin_failure_uses_owned_pageable_storage(self) -> None:
+        orig_empty = torch.empty
+
+        def fail_pinning(*args, **kwargs):
+            if kwargs.get("pin_memory"):
+                raise torch.OutOfMemoryError("simulated pinned Host exhaustion")
+            return orig_empty(*args, **kwargs)
+
+        with patch("mindspeed.core.memory.hyper_offload.runtime.pinned_memory.torch.empty",
+                   side_effect=fail_pinning):
+            pool = PinnedMemoryPool(max_host_bytes=4096, allow_pageable_fallback=True)
+            buf = pool.acquire(1024)
+            self.assertFalse(buf.is_pinned())
+            self.assertEqual(pool.pageable_allocated, 1024)
+            pool.release(buf)
+            reused = pool.acquire(1024)
+            self.assertEqual(reused.data_ptr(), buf.data_ptr())
+            self.assertEqual(pool.total_allocated, 1024)
 
 
 class TestPinnedMemoryPoolNoPin(unittest.TestCase):

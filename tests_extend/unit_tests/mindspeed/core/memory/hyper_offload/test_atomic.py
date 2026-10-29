@@ -299,7 +299,8 @@ def test_new_d2h_event_protects_host_after_an_older_h2d(manager):
     manager.copy_d2h(1)
     old_reader = Mock()
     value._buffer.device_event = old_reader
-    with patch('torch.accelerator.current_stream', return_value=Mock()), \
+    with patch('torch.Tensor.is_pinned', return_value=True), \
+         patch('torch.accelerator.current_stream', return_value=Mock()), \
          patch('torch.Tensor.record_stream'):
         value.add_(1)
         stream = MagicMock()
@@ -366,7 +367,8 @@ def test_failed_transfer_and_failed_drain_keep_a_host_fence(manager, direction):
     manager._copy_stream = stream
     event = Mock()
     event.record.side_effect = RuntimeError('original transfer failure')
-    with patch('torch.accelerator.current_stream', return_value=Mock()), \
+    with patch('torch.Tensor.is_pinned', return_value=True), \
+         patch('torch.accelerator.current_stream', return_value=Mock()), \
          patch('torch.Tensor.record_stream'), patch('torch.Event', return_value=event), \
          patch.object(manager._host_pool, 'release') as release:
         with pytest.raises(RuntimeError, match='original transfer failure'):

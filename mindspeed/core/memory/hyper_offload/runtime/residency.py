@@ -160,9 +160,10 @@ class ResidencyManager:
     def __init__(
         self,
         max_host_bytes: int,
+        allow_pageable_fallback: bool = False,
     ) -> None:
         self._copy_stream = None
-        self._host_pool = PinnedMemoryPool(max_host_bytes)
+        self._host_pool = PinnedMemoryPool(max_host_bytes, allow_pageable_fallback)
         self._residency: dict[int, PhysicalBuffer] = {}
 
     def _get_copy_stream(self) -> torch.Stream:
@@ -288,7 +289,16 @@ class ResidencyManager:
                 dev_src.record_stream(copy_stream)
 
             # 3. Launch asynchronous D2H copy.
-            if dev_src.device != copy_stream.device:
+            if not host_buf.is_pinned():
+                if dev_src.device == copy_stream.device:
+                    producer_stream = torch.accelerator.current_stream()
+                    with copy_stream:
+                        copy_stream.wait_stream(producer_stream)
+                        host_buf.copy_(dev_src, non_blocking=False)
+                    copy_stream.synchronize()
+                else:
+                    host_buf.copy_(dev_src, non_blocking=False)
+            elif dev_src.device != copy_stream.device:
                 host_buf.copy_(dev_src, non_blocking=False)
             else:
                 producer_stream = torch.accelerator.current_stream()
@@ -368,7 +378,18 @@ class ResidencyManager:
         copy_stream = self._get_copy_stream()
         event = None
         try:
-            if dev_bytes.device != copy_stream.device:
+            if not buffer.host_buffer.is_pinned():
+                if dev_bytes.device == copy_stream.device:
+                    producer_stream = torch.accelerator.current_stream()
+                    with copy_stream:
+                        copy_stream.wait_stream(producer_stream)
+                        if buffer.host_event is not None:
+                            buffer.host_event.wait(copy_stream)
+                        dev_bytes.copy_(buffer.host_buffer, non_blocking=False)
+                    copy_stream.synchronize()
+                else:
+                    dev_bytes.copy_(buffer.host_buffer, non_blocking=False)
+            elif dev_bytes.device != copy_stream.device:
                 dev_bytes.copy_(buffer.host_buffer, non_blocking=False)
             else:
                 dev_bytes.record_stream(copy_stream)

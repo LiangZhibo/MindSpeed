@@ -28,6 +28,31 @@ jobs. `MINDSPEED_CONTAINER_NAME` selects an existing configured container.
 `MINDSPEED_IMAGE` overrides the default image for a compatible driver/CANN release.
 Set `HF_TOKEN` if the model endpoint requires authentication.
 
+## Native FSDP2 comparison
+
+`native_fsdp2/launch_comparison.sh` runs the native PyTorch FSDP2 adapter from
+this checkout in an already configured container. It does not create or restart
+containers. The container must use host networking, mount this checkout at
+`/MindSpeed`, mount `/etc/hccn.conf`, and provide `hccn_tool`. The checked-in
+`network.env` records the HCCL timeouts, automatic socket port ranges, and the
+allocator setting used for both cases.
+
+The comparison runs 10 steps without a profiler: 34-layer recomputation, then
+zero recomputation with HyperOffload Peak planning and communication masking.
+Both use `expandable_segments:True`. Set `NPU_DEVICES` and `NUMA_NODE` after
+checking `npu-smi info -l`, health, HBM use, and the host memory on that NUMA
+node. For example:
+
+```bash
+NPU_DEVICES=4,5 NUMA_NODE=0 RUN_ID=local-check \
+  bash examples/qwen25_32b_fsdp2_a2/native_fsdp2/launch_comparison.sh
+```
+
+`QWEN_WORKSPACE`, `DEPENDENCY_ROOT`, `MODEL_PATH`, `OUTPUT_ROOT`,
+`MINDSPEED_CONTAINER_NAME`, and `MASTER_PORT` can override the local defaults.
+Each case records its launch settings and rank results under `profile/` and its
+console output under `logs/`.
+
 Modes: `setup`, `download`, `baseline`, `hyperoffload`, `correctness`, and `all`.
 The default `all` runs the two performance cases. Numerical comparison is explicit
 and runs separately because reference storage, full tensor scans and comparisons
