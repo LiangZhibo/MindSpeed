@@ -26,4 +26,6 @@ jobs:
       - name: Test planners, dispatch, buffers and opt-in integration
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
-        run: python -m pytest tests_extend/unit_tests/mindspeed/core/memory/hyper_offload -q
+        run: >-
+          python -m pytest tests_extend/unit_tests/mindspeed/core/memory/hyper_offload
+          tests_extend/unit_tests/examples/test_qwen_correctness.py -q
