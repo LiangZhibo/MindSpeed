@@ -12,6 +12,7 @@ run_id="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 [[ "$npu_devices" =~ ^[0-7],[0-7]$ ]] || { echo "NPU_DEVICES must be two IDs, got $npu_devices" >&2; exit 2; }
 [[ "$numa_node" =~ ^[0-7]$ ]] || { echo "NUMA_NODE must be in 0..7" >&2; exit 2; }
+[[ "$run_id" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo "RUN_ID must contain only letters, digits, dot, underscore, or dash" >&2; exit 2; }
 [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == true ]] || {
     echo "container is not running: $container" >&2
     exit 1

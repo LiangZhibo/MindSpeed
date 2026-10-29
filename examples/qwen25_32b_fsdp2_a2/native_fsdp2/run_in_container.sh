@@ -4,6 +4,7 @@ set -euo pipefail
 run_id="$1"
 npu_devices="$2"
 numa_node="$3"
+[[ "$run_id" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo "RUN_ID must contain only letters, digits, dot, underscore, or dash" >&2; exit 2; }
 workspace="${QWEN_WORKSPACE:-/data/disk1/machangwei}"
 repo="${MINDSPEED_REPO:-/MindSpeed}"
 script_dir="$repo/examples/qwen25_32b_fsdp2_a2/native_fsdp2"
@@ -38,7 +39,7 @@ export PATH=/opt/codex-node/bin:/usr/local/python3.12.13/bin:$PATH
 export PYTHONPATH="$dependency_root/megatron_03c_compat:$repo:$dependency_root/Megatron-LM-core_r0.18.0:$dependency_root/MegatronAdaptor-core_r0.18.0:$dependency_root/TransformerEngineNPU-26.2.0"
 export ASCEND_RT_VISIBLE_DEVICES="$npu_devices"
 
-case_root="$output_root/native-fsdp2-1030-$run_id"
+case_root="native-fsdp2-1030-$run_id"
 baseline_name="$case_root-recompute-r34"
 offload_name="$case_root-hyperoffload-peak-mask"
 
