@@ -4,9 +4,9 @@ set -euo pipefail
 # Reproduce the measured two-NPU, 10-step Qwen2.5-32B experiment on A2.
 # Default mode: r34 baseline, then r0 HyperOffload, with profile on steps 5/6.
 
-BASE_DIR=/home/m00951751/qwen25-32b-fsdp2
+BASE_DIR="${BASE_DIR:-/home/m00951751/qwen25-32b-fsdp2}"
 MODEL_DIR="$BASE_DIR/Qwen2.5-32B"
-MINDSPEED_DIR="$BASE_DIR/MindSpeed"
+MINDSPEED_DIR="${MINDSPEED_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 FSDP_DIR="$BASE_DIR/runtime/fsdp"
 EXPERIMENT_DIR="$MINDSPEED_DIR/examples/qwen25_32b_fsdp2_a2"
 LOG_DIR="$BASE_DIR/logs"
@@ -14,7 +14,7 @@ PROFILE_DIR="$BASE_DIR/profile"
 USER_HOME="$BASE_DIR/.home"
 CONTAINER_NAME="${MINDSPEED_CONTAINER_NAME:-mindspeed-qwen25-32b-fsdp2-a2}"
 IMAGE="${MINDSPEED_IMAGE:-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindspeed-core:v26.1.0_core_r0.12.1-cann9.1.0-torch_npu2.7.1.post8-910b-openeuler24.03-py3.12}"
-BRANCH=1029
+BRANCH=
 NPU_DEVICES="${NPU_DEVICES:-}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 MASTER_PORT="${MASTER_PORT:-29621}"
@@ -29,17 +29,13 @@ for cmd in docker git python3 npu-smi; do need "$cmd"; done
 mkdir -p "$BASE_DIR" "$LOG_DIR" "$PROFILE_DIR" "$USER_HOME"
 
 prepare_source() {
-    if [[ -d "$MINDSPEED_DIR/.git" ]]; then
-        local branch
-        branch="$(git -C "$MINDSPEED_DIR" branch --show-current)"
-        [[ "$branch" == "$BRANCH" ]] || die "MindSpeed branch is ${branch:-detached}; expected $BRANCH"
-    elif [[ -e "$MINDSPEED_DIR" ]]; then
-        die "$MINDSPEED_DIR exists but is not a git checkout"
-    else
-        git clone --depth=1 --branch "$BRANCH" https://github.com/Mcw-mystory/MindSpeed.git "$MINDSPEED_DIR"
-    fi
-    [[ -f "$EXPERIMENT_DIR/run_qwen25_mindspeed_fsdp2.py" ]] || die "branch $BRANCH is missing its Qwen experiment runner"
-    printf 'MindSpeed branch=%s commit=%s\n' "$BRANCH" "$(git -C "$MINDSPEED_DIR" rev-parse HEAD)"
+    git -C "$MINDSPEED_DIR" rev-parse --show-toplevel >/dev/null 2>&1 ||
+        die "$MINDSPEED_DIR is not a git checkout"
+    BRANCH="$(git -C "$MINDSPEED_DIR" branch --show-current)"
+    for file in run_qwen25_mindspeed_fsdp2.py correctness.py verify_results.py; do
+        [[ -f "$EXPERIMENT_DIR/$file" ]] || die "checkout is missing $file"
+    done
+    printf 'MindSpeed branch=%s commit=%s\n' "${BRANCH:-detached}" "$(git -C "$MINDSPEED_DIR" rev-parse HEAD)"
 }
 
 prepare_fsdp() {
@@ -179,7 +175,7 @@ choose_devices() {
 }
 
 run_case() {
-    local label="$1" recompute="$2" offload="$3"
+    local label="$1" recompute="$2" offload="$3" correctness_mode="${4:-none}" reference_dir="${5:-}"
     local name="qwen25-32b-fsdp2-${label}-${RUN_ID}"
     local out="$PROFILE_DIR/$name" log="$LOG_DIR/$name.log"
     [[ ! -e "$out" && ! -e "$log" ]] || die "output exists: $name; choose another RUN_ID"
@@ -189,9 +185,13 @@ run_case() {
     [[ -z "$inside" ]] || die "Qwen torchrun already runs in container: $inside"
     choose_devices
     mkdir -p "$out" "$LOG_DIR"
-    printf 'started_at=%s\ncase=%s\nbranch=%s\nnpus=%s\nrecompute_layers=%s\nhyper_offload=%s\nsteps=10\nprofile_steps=5,6\n' \
-        "$(date -Is)" "$name" "$BRANCH" "$NPU_DEVICES" "$recompute" "$offload" > "$out/launch.txt"
+    printf 'started_at=%s\ncase=%s\nbranch=%s\nnpus=%s\nrecompute_layers=%s\nhyper_offload=%s\nsteps=10\ncorrectness_mode=%s\nprofile_steps=%s\n' \
+        "$(date -Is)" "$name" "$BRANCH" "$NPU_DEVICES" "$recompute" "$offload" "$correctness_mode" "$([[ "$correctness_mode" == none ]] && printf 5,6 || printf none)" > "$out/launch.txt"
     local offload_args=()
+    if [[ "$correctness_mode" != none ]]; then
+        offload_args+=(--correctness-mode "$correctness_mode" --reference-dir "$reference_dir"
+                       --correctness-steps "${CORRECTNESS_STEPS:-1,2,10}" --no-profile)
+    fi
     [[ "$offload" == 1 ]] && offload_args+=(--hyper-offload --offload-device-mb 2048 --offload-host-mb 131072)
     set +e
     docker exec -u "$RUN_UID:$RUN_GID" -e "HOME=$USER_HOME" -i "$CONTAINER_NAME" \
@@ -211,25 +211,25 @@ export HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800
 export HCCL_HOST_SOCKET_PORT_RANGE=auto HCCL_NPU_SOCKET_PORT_RANGE=auto
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:2048 TOKENIZERS_PARALLELISM=false
 torchrun --standalone --nnodes=1 --nproc_per_node=2 --master_port="$MASTER_PORT" \
-  /home/m00951751/qwen25-32b-fsdp2/MindSpeed/examples/qwen25_32b_fsdp2_a2/run_qwen25_mindspeed_fsdp2.py \
+  /MindSpeed/examples/qwen25_32b_fsdp2_a2/run_qwen25_mindspeed_fsdp2.py \
   --model-path "$MODEL_DIR" --profile-path "$PROFILE_PATH" \
   --recompute-layers "$RECOMPUTE" --extra-steps 9 "${OFFLOAD_ARGS[@]}"
 TRAIN
     local status=$?
     set -e
-    printf 'finished_at=%s\nexit_code=%s\n' "$(date -Is)" "$status" > "$out/exit.txt"
-    ((status == 0)) || die "$name failed; inspect $log and $out"
-    python3 - "$out" <<'VERIFY'
-import json, os, sys
-for rank in (0, 1):
-    with open(os.path.join(sys.argv[1], f"result_rank{rank}.json"), encoding="utf-8") as f:
-        result = json.load(f)
-    if result.get("status") != "steps_complete" or result.get("steps") != 10:
-        raise SystemExit(f"rank {rank}: incomplete result {result.get('status')}/{result.get('steps')}")
-    if not result.get("probe_grad_max") or not result.get("parameter_update_max"):
-        raise SystemExit(f"rank {rank}: first-step gradient/update was zero")
-print("verified: both ranks completed ten steps with nonzero gradient and parameter update")
-VERIFY
+    printf 'finished_at=%s\ntraining_exit_code=%s\n' "$(date -Is)" "$status" > "$out/exit.txt"
+    if ((status != 0)); then
+        printf 'exit_code=%s\n' "$status" >> "$out/exit.txt"
+        die "$name failed; inspect $log and $out"
+    fi
+    if python3 "$EXPERIMENT_DIR/verify_results.py" "$out" --steps 10 --correctness-mode "$correctness_mode"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf 'verification_exit_code=%s\nexit_code=%s\n' "$status" "$status" >> "$out/exit.txt"
+    ((status == 0)) || die "$name validation failed; inspect $out"
+
     printf 'completed=%s\nlog=%s\nprofile=%s\n' "$name" "$log" "$out"
 }
 
@@ -256,6 +256,15 @@ case "$MODE" in
         download_model
         run_case hyperoffload-r0 0 1
         ;;
+    correctness)
+        prepare_source
+        prepare_container
+        download_model
+        reference_dir="$PROFILE_DIR/qwen25-32b-reference-$RUN_ID"
+        [[ ! -e "$reference_dir" ]] || die "reference exists: $reference_dir; choose another RUN_ID"
+        run_case baseline-correctness-r34 34 0 record "$reference_dir"
+        run_case hyperoffload-correctness-r0 0 1 compare "$reference_dir"
+        ;;
     all)
         prepare_source
         prepare_container
@@ -263,5 +272,5 @@ case "$MODE" in
         run_case baseline-r34 34 0
         run_case hyperoffload-r0 0 1
         ;;
-    *) die "usage: $0 {setup|download|baseline|hyperoffload|all}" ;;
+    *) die "usage: $0 {setup|download|baseline|hyperoffload|correctness|all}" ;;
 esac

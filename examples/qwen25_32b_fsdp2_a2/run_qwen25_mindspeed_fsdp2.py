@@ -17,6 +17,8 @@ import torch_npu  # noqa: F401
 from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM
 
+from correctness import NumericalValidator, check_chunk_loss, finite_scalar, selected_steps
+
 from mindspeed.fsdp.mindspeed_parallel_engine import MindSpeedParallelEngine
 from mindspeed.fsdp.parallel_engine_config import FSDPPlanConfig, ParallelEngineConfig
 from mindspeed.fsdp.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss
@@ -68,7 +70,23 @@ def parse_args():
     parser.add_argument("--offload-host-mb", type=int, default=32768)
     parser.add_argument("--offload-planner", choices=("peak", "greedy"), default="peak")
     parser.add_argument("--extra-steps", type=int, default=0)
-    return parser.parse_args()
+    parser.add_argument("--correctness-mode", choices=("none", "record", "compare"), default="none")
+    parser.add_argument("--reference-dir", type=Path)
+    parser.add_argument("--correctness-steps", help="snapshot steps, default: first, second, last")
+    for kind, rtol, atol in (("loss", 1e-3, 1e-3), ("gradient", 2e-2, 1e-5), ("parameter", 1e-2, 1e-5)):
+        parser.add_argument(f"--{kind}-rtol", type=float, default=rtol)
+        parser.add_argument(f"--{kind}-atol", type=float, default=atol)
+    args = parser.parse_args()
+    if args.correctness_mode != "none":
+        if args.reference_dir is None:
+            parser.error("--reference-dir is required for numerical validation")
+        if not args.no_profile:
+            parser.error("numerical validation requires --no-profile; run performance separately")
+        try:
+            args.validation_steps = selected_steps(args.correctness_steps, 1 + args.extra_steps)
+        except ValueError as exc:
+            parser.error(str(exc))
+    return args
 
 
 def log(rank, message):
@@ -179,6 +197,20 @@ def make_profile(args):
     )
 
 
+def validate_on_all_ranks(check):
+    error = None
+    try:
+        value = check()
+    except Exception as exc:
+        error = str(exc)
+        value = None
+    failed = torch.tensor(int(error is not None), dtype=torch.int32, device="npu")
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if failed.item():
+        raise RuntimeError(error or "validation failed on another rank")
+    return value
+
+
 def main():
     args = parse_args()
     if args.extra_steps < 0:
@@ -193,6 +225,7 @@ def main():
     if dist.get_world_size() != 2:
         raise RuntimeError(f"expected exactly two NPU workers, got world size {dist.get_world_size()}")
     apply_hccl_premul_sum_patch()
+    loss_self_check = validate_on_all_ranks(lambda: check_chunk_loss(chunk_loss, calculate_lm_loss))
     log(rank, f"ENV torch={torch.__version__} torch_npu={torch_npu.__version__} visible={os.environ['ASCEND_RT_VISIBLE_DEVICES']}")
     engine, vocab_size, parameter_count = make_engine(args, rank)
     engine.train()
@@ -204,6 +237,19 @@ def main():
     dist.barrier()
     torch.npu.synchronize()
     torch.npu.reset_peak_memory_stats()
+    validator = None
+    if args.correctness_mode != "none":
+        contract = dict(rank=rank, world_size=dist.get_world_size(), total_steps=1 + args.extra_steps,
+                        seed=1234 + rank, layers=args.layers, seq_length=args.seq_length,
+                        loss_chunk=args.loss_chunk, parameter_count=parameter_count,
+                        optimizer="SGD", learning_rate=0.01, torch_version=torch.__version__,
+                        torch_npu_version=torch_npu.__version__, parameter_dtype="bfloat16",
+                        reduce_dtype="float32", input_shape=list(input_ids.shape))
+        tolerances = {kind: dict(rtol=getattr(args, f"{kind}_rtol"), atol=getattr(args, f"{kind}_atol"))
+                      for kind in ("loss", "gradient", "parameter")}
+        validator = validate_on_all_ranks(lambda: NumericalValidator(
+            engine, input_ids, args.reference_dir, rank, args.correctness_mode,
+            args.validation_steps, contract, tolerances))
     profiler = make_profile(args)
     session = None
     offload_stats = {"d2h_calls": 0, "d2h_gib": 0.0}
@@ -226,6 +272,8 @@ def main():
     started = time.perf_counter()
     result = {
         "rank": rank,
+        "chunk_loss_self_check": loss_self_check,
+        "correctness": {"mode": "none", "status": "not_requested"} if validator is None else validator.summary("pending"),
         "world_size": 2,
         "parameter_count": parameter_count,
         "layers": args.layers,
@@ -243,6 +291,21 @@ def main():
         "optimizer": "SGD",
         "learning_rate": 1.0e-2,
     }
+
+    def check_backward(step, loss, grad_max):
+        def check():
+            finite_scalar(loss, f"step {step} loss")
+            finite_scalar(grad_max, f"step {step} probe gradient", positive=True)
+            if validator is not None:
+                validator.backward(step, loss)
+        validate_on_all_ranks(check)
+
+    def check_update(step, update):
+        def check():
+            finite_scalar(update, f"step {step} parameter update", positive=True)
+            if validator is not None:
+                validator.update(step)
+        validate_on_all_ranks(check)
 
     def write_progress():
         snapshot = dict(result)
@@ -270,11 +333,13 @@ def main():
             raise RuntimeError("first-layer MLP probe parameter has no gradient")
         probe_grad_local = probe_grad.to_local() if isinstance(probe_grad, DTensor) else probe_grad
         grad_max = float(probe_grad_local.detach().reshape(-1)[:4096].abs().max())
+        check_backward(1, float(loss.item()), grad_max)
         optimizer.step()
         if profiler is not None:
             profiler.step()
         probe_local = probe_parameter.to_local() if isinstance(probe_parameter, DTensor) else probe_parameter
         update = float((probe_local.detach().reshape(-1)[:4096] - probe_before).abs().max())
+        check_update(1, update)
         result.update(
             status="one_step_complete", steps=1, loss=float(loss.item()),
             probe_grad_max=grad_max, parameter_update_max=update,
@@ -314,6 +379,7 @@ def main():
                 raise RuntimeError("first-layer MLP probe parameter has no gradient")
             step_grad_local = step_grad.to_local() if isinstance(step_grad, DTensor) else step_grad
             step_grad_max = float(step_grad_local.detach().reshape(-1)[:4096].abs().max())
+            check_backward(step_index + 2, float(step_loss.item()), step_grad_max)
             optimizer.step()
             probe_local = probe_parameter.to_local() if isinstance(probe_parameter, DTensor) else probe_parameter
             step_result = {
@@ -326,6 +392,7 @@ def main():
                 "npu_peak_reserved_gib": torch.npu.max_memory_reserved() / 2**30,
                 "offload_mode": session.mode if session is not None else None,
             }
+            check_update(step_index + 2, step_result["parameter_update_max"])
             result["extra_step_results"].append(step_result)
             result["steps"] += 1
             log(rank, "EXTRA_STEP " + json.dumps(step_result))
@@ -336,10 +403,14 @@ def main():
             # forward so they cannot pin allocations across iterations.
             del step_loss, step_grad, step_grad_local
             write_progress()
+        if validator is not None:
+            result["correctness"] = validate_on_all_ranks(validator.finish)
         if args.extra_steps:
             result["status"] = "steps_complete"
     except BaseException as exc:
         result.update(status="failed", error=str(exc), traceback=traceback.format_exc())
+        if validator is not None:
+            result["correctness"] = validator.summary("failed")
         raise
     finally:
         if profiler is not None:
