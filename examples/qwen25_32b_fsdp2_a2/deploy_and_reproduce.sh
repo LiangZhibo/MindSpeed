@@ -7,6 +7,7 @@ set -euo pipefail
 BASE_DIR=/home/m00951751/qwen25-32b-fsdp2
 MODEL_DIR="$BASE_DIR/Qwen2.5-32B"
 MINDSPEED_DIR="$BASE_DIR/MindSpeed"
+FSDP_DIR="$BASE_DIR/runtime/fsdp"
 EXPERIMENT_DIR="$MINDSPEED_DIR/examples/qwen25_32b_fsdp2_a2"
 LOG_DIR="$BASE_DIR/logs"
 PROFILE_DIR="$BASE_DIR/profile"
@@ -41,14 +42,40 @@ prepare_source() {
     printf 'MindSpeed branch=%s commit=%s\n' "$BRANCH" "$(git -C "$MINDSPEED_DIR" rev-parse HEAD)"
 }
 
+prepare_fsdp() {
+    local image_id
+    image_id="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+    if [[ -e "$FSDP_DIR" ]]; then
+        [[ -f "$FSDP_DIR/mindspeed_parallel_engine.py" && -f "$FSDP_DIR/.source-image-id" ]] ||
+            die "incomplete FSDP runtime at $FSDP_DIR"
+        [[ "$(cat "$FSDP_DIR/.source-image-id")" == "$image_id" ]] ||
+            die "FSDP runtime came from a different image: $FSDP_DIR"
+        return
+    fi
+    mkdir -p "$BASE_DIR/runtime"
+    docker run --rm --user "$RUN_UID:$RUN_GID" --entrypoint bash \
+        -v "$BASE_DIR/runtime:/export:rw" "$IMAGE" -c '
+            set -euo pipefail
+            test -f /MindSpeed/mindspeed/fsdp/mindspeed_parallel_engine.py
+            cp -R /MindSpeed/mindspeed/fsdp /export/fsdp
+        '
+    [[ -f "$FSDP_DIR/mindspeed_parallel_engine.py" ]] || die "FSDP extraction failed"
+    printf '%s\n' "$image_id" > "$FSDP_DIR/.source-image-id"
+    printf 'FSDP runtime extracted from image: %s\n' "$IMAGE"
+}
+
 prepare_container() {
     [[ -e /usr/local/Ascend/driver ]] || die "Ascend driver not found at /usr/local/Ascend/driver"
     docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
+    prepare_fsdp
     if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-        local mounts
+        local mounts container_image_id
         mounts="$(docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' "$CONTAINER_NAME")"
+        container_image_id="$(docker inspect --format '{{.Image}}' "$CONTAINER_NAME")"
+        [[ "$container_image_id" == "$(docker image inspect --format '{{.Id}}' "$IMAGE")" ]] || die "existing container uses a different image"
         grep -Fq "$BASE_DIR -> $BASE_DIR" <<<"$mounts" || die "existing container does not mount $BASE_DIR"
         grep -Fq "$MINDSPEED_DIR -> /MindSpeed" <<<"$mounts" || die "existing container does not mount $MINDSPEED_DIR at /MindSpeed"
+        grep -Fq "$FSDP_DIR -> /MindSpeed/mindspeed/fsdp" <<<"$mounts" || die "existing container does not mount the image FSDP runtime"
         docker start "$CONTAINER_NAME" >/dev/null
     else
         local mounts=()
@@ -70,6 +97,7 @@ prepare_container() {
             --ulimit stack=67108864 -e "HOME=$USER_HOME" \
             -e PATH=/usr/local/python3.12.13/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/bin:/usr/bin:/bin \
             "${mounts[@]}" -v "$BASE_DIR:$BASE_DIR" -v "$MINDSPEED_DIR:/MindSpeed" \
+            -v "$FSDP_DIR:/MindSpeed/mindspeed/fsdp:ro" \
             -w "$BASE_DIR" "$IMAGE" bash -lc 'sleep infinity' >/dev/null
     fi
 

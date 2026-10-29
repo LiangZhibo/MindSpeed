@@ -13,7 +13,8 @@ git clone --depth=1 --branch 1029 https://github.com/Mcw-mystory/MindSpeed.git /
 bash /tmp/MindSpeed-1029/examples/qwen25_32b_fsdp2_a2/deploy_and_reproduce.sh all
 ```
 
-The script creates `/home/m00951751/qwen25-32b-fsdp2`, checks or creates the
+The script creates `/home/m00951751/qwen25-32b-fsdp2`, extracts the FSDP2
+runtime from the pinned Ascend image into `runtime/fsdp`, checks or creates the
 Ascend container, downloads the Qwen2.5-32B safetensors, selects two healthy
 idle NPUs, and runs the cases sequentially. Set `NPU_DEVICES=0,1` to choose a
 specific pair. Set `HF_TOKEN` if the Hugging Face endpoint requires
@@ -53,7 +54,8 @@ differ from the original machine.
 - Warmup now recycles activation buffers whose wrappers are no longer live
   before enforcing the device residency budget. This releases stale Host-pool
   allocations during trace capture.
-- `mindspeed/fsdp/` contains the FSDP2 package copied from the matching
-  `mindspeed-core:v26.1.0` runtime image. The HyperOffload branch does not
-  include this package, while the measured FSDP2 runner depends on it.
+- The HyperOffload branch does not include `mindspeed/fsdp/`, while the measured
+  FSDP2 runner depends on it. The setup script extracts that package from the
+  selected `mindspeed-core:v26.1.0` image and mounts it read-only under
+  `/MindSpeed/mindspeed/fsdp`; the image package is not copied into this branch.
 - Unit tests cover dispatch isolation and warmup reclamation behavior.
