@@ -17,17 +17,20 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 from typing import Any
 
 import unittest
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from mindspeed.core.memory.hyper_offload.runtime.residency import (
     PhysicalBuffer,
     ResidencyManager,
 )
+from mindspeed.core.memory.hyper_offload.execution.tensor import ShadowTensor
 
 # ---------------------------------------------------------------------------
 # Mock helpers for CPU-only testing
@@ -327,6 +330,37 @@ class TestResidencyManagerTransitions(unittest.TestCase):
         self.manager.copy_d2h(1)
         buf = self.manager._residency[1]  # pylint: disable=protected-access
         self.assertIsNotNone(buf.host_buffer)
+
+    def test_internal_transfers_do_not_reenter_activation_dispatch(self) -> None:
+        class RejectInternalOps(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                raise AssertionError(f"internal transfer entered activation dispatch: {func}")
+
+        source = torch.arange(16, dtype=torch.uint8)
+        self.manager.bind(1, source)
+        with RejectInternalOps():
+            self.manager.copy_d2h(1)
+            self.manager.release_device(1)
+            self.manager.copy_h2d(1)
+            self.manager.release_host(1)
+        restored = self.manager._residency[1].device_buffer
+        torch.testing.assert_close(restored, source)
+
+    def test_dead_activation_recycles_its_host_buffer(self) -> None:
+        source = torch.arange(16, dtype=torch.uint8)
+        physical = self.manager.bind(1, source)
+        shadow = ShadowTensor(source, physical, 1)
+        self.manager.copy_d2h(1)
+        self.manager.release_device(1)
+
+        self.manager.release_unreferenced(set())
+        self.assertIn(1, self.manager._residency)
+
+        del shadow
+        gc.collect()
+        self.manager.release_unreferenced(set())
+        self.assertNotIn(1, self.manager._residency)
+        self.assertEqual(len(self.manager._host_pool._leased), 0)
 
     def test_copy_d2h_noop_when_already_on_host(self) -> None:
         t = torch.randn(4, 4)

@@ -23,12 +23,24 @@ from __future__ import annotations
 import logging
 import weakref
 from dataclasses import dataclass, field
+from functools import wraps
 
 import torch
+from torch.utils._python_dispatch import _disable_current_modes
 
 from mindspeed.core.memory.hyper_offload.runtime.pinned_memory import PinnedMemoryPool
 
 logger = logging.getLogger(__name__)
+
+
+def _without_dispatch_modes(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        # Runtime copies and allocations are not model activations.
+        with _disable_current_modes():
+            return fn(*args, **kwargs)
+
+    return wrapped
 
 
 @dataclass
@@ -233,6 +245,7 @@ class ResidencyManager:
     # State transition: copy D2H
     # ------------------------------------------------------------------
 
+    @_without_dispatch_modes
     def copy_d2h(self, sid: int) -> None:
         """Copy the physical storage for *sid* from device to host.
 
@@ -310,6 +323,7 @@ class ResidencyManager:
     # State transition: copy H2D
     # ------------------------------------------------------------------
 
+    @_without_dispatch_modes
     def copy_h2d(self, sid: int) -> None:
         """Asynchronously copy (H2D) the physical storage for *sid* to device.
 
@@ -410,6 +424,7 @@ class ResidencyManager:
         if buffer.host_buffer is None:
             del self._residency[sid]
 
+    @_without_dispatch_modes
     def release_host(self, sid: int) -> None:
         """Release host-resident bytes for a storage ID.
 
@@ -430,6 +445,18 @@ class ResidencyManager:
         buffer.host_event = None
         buffer.host_access_event = None
         if buffer.device_buffer is None:
+            del self._residency[sid]
+
+    @_without_dispatch_modes
+    def release_unreferenced(self, protected_sids: set[int]) -> None:
+        """Recycle buffers whose activation wrappers have all been freed."""
+        for sid, buffer in list(self._residency.items()):
+            if sid in protected_sids or buffer.shadows:
+                continue
+            if buffer.device_event is not None:
+                buffer.device_event.synchronize()
+            if buffer.host_buffer is not None:
+                self._host_pool.release(buffer.host_buffer, event=buffer.host_reuse_event)
             del self._residency[sid]
 
     # ------------------------------------------------------------------

@@ -20,10 +20,23 @@ efficient host-device data transfers during activation offloading.
 
 import logging
 import threading
+from functools import wraps
 
 import torch
+from torch.utils._python_dispatch import _disable_current_modes
 
 logger = logging.getLogger(__name__)
+
+
+def _outside_dispatch(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Pool bookkeeping allocates CPU tensors while holding its lock. Those
+        # allocations must not reenter the activation dispatcher and pool.
+        with _disable_current_modes():
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 _BUCKET_SIZES = [2**i for i in range(10, 32)]
 
@@ -86,6 +99,7 @@ class PinnedMemoryPool:
                 still_pending.append((tensor, event))
         self._pending[bucket] = still_pending
 
+    @_outside_dispatch
     def acquire(self, size: int) -> torch.Tensor:
         """Obtain a buffer of at least *size* bytes from the pool."""
         if isinstance(size, bool) or not isinstance(size, int):
@@ -129,6 +143,7 @@ class PinnedMemoryPool:
                 f"max_host_bytes={self._max_host_bytes}, requested={size}"
             )
 
+    @_outside_dispatch
     def release(self, tensor: torch.Tensor, event: torch.Event | torch.Stream | None = None) -> None:
         """Return a buffer, retaining its event or failed-transfer stream fence."""
         if not tensor.is_pinned():

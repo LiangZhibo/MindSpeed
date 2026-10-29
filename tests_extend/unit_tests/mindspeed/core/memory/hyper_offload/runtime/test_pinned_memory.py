@@ -21,6 +21,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from mindspeed.core.memory.hyper_offload.runtime.pinned_memory import PinnedMemoryPool, _bucket_for
 
@@ -104,6 +105,21 @@ class TestPinnedMemoryPoolNoPin(unittest.TestCase):
         # Acquire again — should reuse
         buf2 = self.pool.acquire(64)
         self.assertIsInstance(buf2, torch.Tensor)
+
+    def test_pool_operations_do_not_reenter_dispatch(self) -> None:
+        """Host allocation under the pool lock must not invoke activation tracing."""
+        class CountingMode(TorchDispatchMode):
+            calls = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                self.calls += 1
+                return func(*args, **(kwargs or {}))
+
+        mode = CountingMode()
+        with mode:
+            buf = self.pool.acquire(64)
+            self.pool.release(buf)
+        self.assertEqual(mode.calls, 0)
 
     def test_acquire_and_release_with_event(self) -> None:
         """Release with an event should go to pending, not directly to pool."""
