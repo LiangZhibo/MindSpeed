@@ -1,0 +1,8 @@
+sharding_size: 2
+reshard_after_forward: true
+param_dtype: bf16
+reduce_dtype: fp32
+output_dtype: bf16
+cast_forward_inputs: true
+offload_to_cpu: false
+num_to_forward_prefetch: 1
