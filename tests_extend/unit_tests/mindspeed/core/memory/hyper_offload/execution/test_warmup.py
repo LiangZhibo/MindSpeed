@@ -48,6 +48,9 @@ class _FakeResidencyManager:
     def device_resident_size(self, sid: int) -> int | None:
         return self._resident.get(sid)
 
+    def release_unreferenced(self, protected_sids: set[int]) -> None:
+        pass
+
     def copy_d2h(self, sid: int) -> None:
         self.calls.append(f"copy_d2h({sid})")
 
