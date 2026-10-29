@@ -38,7 +38,8 @@ def _outside_dispatch(fn):
 
     return wrapper
 
-_BUCKET_SIZES = [2**i for i in range(10, 32)]
+_BUCKET_SIZES = [2**i for i in range(10, 22)]
+_LARGE_BUCKET_GRANULARITY = 2**21
 
 
 def _align_to_bucket(size: int) -> int:
@@ -46,7 +47,10 @@ def _align_to_bucket(size: int) -> int:
     for bucket in _BUCKET_SIZES:
         if bucket >= size:
             return bucket
-    return size
+    # Large activations are common in long-context models. Power-of-two
+    # buckets can waste almost half of pinned Host memory for each buffer.
+    return ((size + _LARGE_BUCKET_GRANULARITY - 1) //
+            _LARGE_BUCKET_GRANULARITY) * _LARGE_BUCKET_GRANULARITY
 
 
 def _bucket_for(size: int) -> int:
@@ -55,14 +59,15 @@ def _bucket_for(size: int) -> int:
 
 
 class PinnedMemoryPool:
-    """Thread-safe pool of pinned host CPU memory buffers with deferred recycling via CUDA events.
+    """Thread-safe Host buffer pool with deferred recycling via device events.
 
     If capacity is exhausted, a pending buffer may be waited for and reused.
     When no reusable buffer exists, acquire raises instead of silently
-    exceeding ``max_host_bytes`` or switching to pageable CPU memory.
+    exceeding the configured Host capacity. An optional pageable fallback
+    keeps offload usable when the accelerator runtime cannot pin more pages.
     """
 
-    def __init__(self, max_host_bytes: int) -> None:
+    def __init__(self, max_host_bytes: int, allow_pageable_fallback: bool = False) -> None:
         self._pool: dict[int, list[torch.Tensor]] = {}
         self._pending: dict[int, list[tuple[torch.Tensor, torch.Event | torch.Stream]]] = {}
         self._lock = threading.Lock()
@@ -70,6 +75,15 @@ class PinnedMemoryPool:
         self._max_host_bytes = max_host_bytes
         self._owned_storages = {}
         self._leased = set()
+        self._pageable_storages = set()
+        self._pageable_allocated = 0
+        self._pinning_exhausted = False
+        self._allow_pageable_fallback = allow_pageable_fallback
+
+    @property
+    def pageable_allocated(self) -> int:
+        """Bytes allocated without pinned Host pages after pinning fails."""
+        return self._pageable_allocated
 
     def _lease(self, tensor, size):
         """Called under the lock when ownership passes to a borrower."""
@@ -118,9 +132,26 @@ class PinnedMemoryPool:
 
             aligned = _align_to_bucket(size)
             if self._total_allocated + aligned <= self._max_host_bytes:
-                allocation = torch.empty(aligned, dtype=torch.uint8, pin_memory=True)
+                pageable = self._pinning_exhausted
+                if not pageable:
+                    try:
+                        allocation = torch.empty(aligned, dtype=torch.uint8, pin_memory=True)
+                    except torch.OutOfMemoryError:
+                        if not self._allow_pageable_fallback:
+                            raise
+                        self._pinning_exhausted = True
+                        pageable = True
+                        logger.warning(
+                            "Pinned Host allocation failed; using synchronous pageable "
+                            "Host buffers for later HyperOffload transfers"
+                        )
+                if pageable:
+                    allocation = torch.empty(aligned, dtype=torch.uint8)
                 storage = allocation.untyped_storage()
                 self._owned_storages[storage._cdata] = storage
+                if pageable:
+                    self._pageable_storages.add(storage._cdata)
+                    self._pageable_allocated += aligned
                 self._total_allocated += aligned
                 logger.debug(
                     "PinnedMemoryPool: allocate %d bytes (total=%d, limit=%d)",
@@ -145,12 +176,7 @@ class PinnedMemoryPool:
 
     @_outside_dispatch
     def release(self, tensor: torch.Tensor, event: torch.Event | torch.Stream | None = None) -> None:
-        """Return a buffer, retaining its event or failed-transfer stream fence."""
-        if not tensor.is_pinned():
-            raise ValueError(
-                "release() expects a pinned (page-locked) tensor, "
-                f"got tensor on {tensor.device} with pin_memory={tensor.is_pinned()}"
-            )
+        """Return an owned buffer, retaining any transfer completion fence."""
 
         storage = tensor.untyped_storage()
         full_tensor = torch.empty(0, dtype=torch.uint8, device="cpu")
@@ -161,6 +187,8 @@ class PinnedMemoryPool:
             identity = storage._cdata
             if identity not in self._owned_storages:
                 raise ValueError("release() storage is not owned by this Host pool")
+            if not tensor.is_pinned() and identity not in self._pageable_storages:
+                raise ValueError("release() expects a pinned buffer or owned pageable fallback")
             if identity not in self._leased:
                 raise ValueError("release() storage is not leased or was already released")
             self._leased.remove(identity)

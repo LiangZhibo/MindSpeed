@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import sys
 
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
 from mindspeed.core.memory.hyper_offload.api.config import OffloadConfig
 from mindspeed.core.memory.hyper_offload.execution.replay import ReplayExecutor
@@ -28,6 +29,16 @@ from mindspeed.core.memory.hyper_offload.planning.greedy import GreedyResidencyP
 from mindspeed.core.memory.hyper_offload.runtime.residency import ResidencyManager
 
 logger = logging.getLogger(__name__)
+
+
+def _inside_fsdp_internal() -> bool:
+    """Keep parameter gather and reshard operations out of activation tracking."""
+    frame = sys._getframe(1)  # pylint: disable=protected-access
+    while frame is not None:
+        if "/torch/distributed/fsdp/_fully_shard/" in frame.f_code.co_filename:
+            return True
+        frame = frame.f_back
+    return False
 
 # Context variable tracking the active OffloadSession (set on __enter__).
 _active_session: contextvars.ContextVar[OffloadSession | None] = contextvars.ContextVar("_active_session", default=None)
@@ -47,6 +58,9 @@ class ActivationDispatchMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
         """Dispatch a torch operation."""
+        if _inside_fsdp_internal():
+            with _disable_current_modes():
+                return func(*args, **(kwargs or {}))
         return self.session.executor.dispatch(func, args, kwargs)
 
 
@@ -64,6 +78,7 @@ class OffloadSession:
         self.planner = config.planner or GreedyResidencyPlanner()
         self.residency_manager = ResidencyManager(
             max_host_bytes=config.max_offload_activation_mb * 1024**2,
+            allow_pageable_fallback=True,
         )
         self.executor: WarmupExecutor | ReplayExecutor = WarmupExecutor(
             residency_manager=self.residency_manager,
