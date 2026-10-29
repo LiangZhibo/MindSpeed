@@ -80,6 +80,7 @@ class WarmupExecutor(BaseExecutor):
 
     def _enforce_budget(self, protected_sids: set[int]) -> None:
         """Evict warmup activations until resident bytes fit the configured budget."""
+        self.residency_manager.release_unreferenced(protected_sids)
         while self.residency_manager.resident_bytes > self._memory_limit_bytes:
             # Greedy: evict oldest first; within the same op, evict largest first.
             victim_sid: int | None = None
