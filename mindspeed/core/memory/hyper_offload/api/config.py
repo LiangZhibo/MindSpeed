@@ -33,14 +33,19 @@ class OffloadConfig:
         max_offload_activation_mb:  Maximum pinned host memory for offload buffers, in MiB.
             Defaults to 65536 (64 GiB).
         planner: Optional residency planner implementation.
+        trim_cache_before_replay: Release inactive accelerator cache before each
+            replay pass. Disabled by default because it synchronizes the device.
 
     """
 
     max_resident_activation_mb: int = 1024
     max_offload_activation_mb: int = 65536
     planner: ResidencyPlanner | None = None
+    trim_cache_before_replay: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.trim_cache_before_replay, bool):
+            raise TypeError("trim_cache_before_replay must be boolean")
         for name in ("max_resident_activation_mb", "max_offload_activation_mb"):
             value = getattr(self, name)
             if isinstance(value, bool):
