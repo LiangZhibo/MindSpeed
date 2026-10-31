@@ -15,6 +15,7 @@ class HyperOffloadFeature(MindSpeedFeature):
         group.add_argument("--hyper-offload-host-mb", type=int, default=65536)
         group.add_argument("--hyper-offload-planner", choices=("greedy", "peak"), default="peak")
         group.add_argument("--hyper-offload-communication-masking", action="store_true")
+        group.add_argument("--hyper-offload-trim-cache-before-replay", action="store_true")
 
     def validate_args(self, args):
         if not getattr(args, "hyper_offload", False):

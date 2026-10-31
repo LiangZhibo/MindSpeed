@@ -71,3 +71,13 @@ def test_cli_configuration_selects_planner_and_budgets(kind, expected):
     assert isinstance(config.planner, expected)
     assert config.max_resident_activation_mb == 24
     assert config.max_offload_activation_mb == 128
+    assert not config.trim_cache_before_replay
+
+
+def test_cli_configuration_enables_explicit_cache_trim():
+    config = config_from_args(SimpleNamespace(
+        hyper_offload_planner="peak", hyper_offload_communication_masking=False,
+        hyper_offload_device_mb=24, hyper_offload_host_mb=128,
+        hyper_offload_trim_cache_before_replay=True,
+    ))
+    assert config.trim_cache_before_replay

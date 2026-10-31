@@ -24,6 +24,7 @@ def config_from_args(args):
         max_resident_activation_mb=args.hyper_offload_device_mb,
         max_offload_activation_mb=args.hyper_offload_host_mb,
         planner=planner,
+        trim_cache_before_replay=getattr(args, "hyper_offload_trim_cache_before_replay", False),
     )
 
 
@@ -66,7 +67,8 @@ def get_forward_backward_func_wrapper(factory):
         if not getattr(graph_args, "hyper_offload", False):
             return schedule
         key = (graph_args.hyper_offload_planner, graph_args.hyper_offload_communication_masking,
-               graph_args.hyper_offload_device_mb, graph_args.hyper_offload_host_mb)
+               graph_args.hyper_offload_device_mb, graph_args.hyper_offload_host_mb,
+               getattr(graph_args, "hyper_offload_trim_cache_before_replay", False))
         if schedule is not cached_schedule or key != cached_key:
             cached_wrapper = wrap_schedule(schedule, config_from_args(graph_args))
             cached_schedule, cached_key = schedule, key
