@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from itertools import accumulate
+
 from mindspeed.core.memory.hyper_offload.ir.trace import (
     AccessKind,
     ActivationTrace,
@@ -44,6 +46,15 @@ def build_profile_and_candidates(
     """Build the resident-memory profile and all evictable candidates."""
     resident_bytes = [0] * len(trace.ops)
     edge_bytes = [0] * max(0, len(resident_bytes) - 1)
+    resident_delta = [0] * (len(resident_bytes) + 1)
+    edge_delta = [0] * (len(edge_bytes) + 1)
+    last_alias_use = {}
+    for index, op in enumerate(trace.ops):
+        storage_ids = {access.storage_id for access in op.accesses}
+        if len(storage_ids) == 1:
+            sid = next(iter(storage_ids))
+            if is_alias_forward_op(op, sid):
+                last_alias_use[sid] = index
     candidates: list[PeakCandidate] = []
     boundary_candidates: list[PeakCandidate] = []
     releasable: dict[int, StorageAccess] = {}
@@ -55,13 +66,21 @@ def build_profile_and_candidates(
 
         ordered = sorted(accesses, key=lambda access: access.op_id)
         first_op_id = ordered[0].op_id
-        last_op_id = extend_last_use_for_alias_ops(trace, sid, ordered[-1].op_id)
+        last_op_id = max(ordered[-1].op_id, last_alias_use.get(sid, ordered[-1].op_id))
         if sid in trace.retained_sids:
             last_op_id = len(trace.ops) - 1
         if first_op_id > last_op_id:
             continue
 
-        _add_lifetime_bytes(resident_bytes, edge_bytes, first_op_id, last_op_id, size_bytes)
+        start = max(0, first_op_id)
+        end = min(len(resident_bytes), last_op_id + 1)
+        if start < end:
+            resident_delta[start] += size_bytes
+            resident_delta[end] -= size_bytes
+        end = min(len(edge_bytes), last_op_id)
+        if start < end:
+            edge_delta[start] += size_bytes
+            edge_delta[end] -= size_bytes
         if sid in trace.retained_sids:
             continue
 
@@ -79,6 +98,8 @@ def build_profile_and_candidates(
         boundary_candidates.extend(storage_boundary_candidates)
 
     candidates.sort(key=lambda candidate: candidate.peak_reduction_score, reverse=True)
+    resident_bytes = list(accumulate(resident_delta[:-1]))
+    edge_bytes = list(accumulate(edge_delta[:-1]))
     return ProfileAndCandidates(
         resident_bytes=resident_bytes,
         edge_bytes=edge_bytes,
@@ -121,11 +142,7 @@ def is_alias_forward_op(op, sid: int) -> bool:
         return False
     op_storage_ids = {access.storage_id for access in op.accesses}
     access_kinds = {access.kind for access in accesses}
-    return (
-        len(op_storage_ids) == 1
-        and AccessKind.READ in access_kinds
-        and AccessKind.WRITE in access_kinds
-    )
+    return len(op_storage_ids) == 1 and AccessKind.READ in access_kinds and AccessKind.WRITE in access_kinds
 
 
 def build_candidates_for_storage(

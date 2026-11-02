@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from itertools import accumulate
+
 from mindspeed.core.memory.hyper_offload.planning.peak_strategy.types import (
     CandidateScoreContext,
     PeakCandidate,
@@ -50,16 +52,20 @@ def compute_unavoidable_peak(
     if not resident_bytes:
         return None
 
-    reducible_bytes = [0] * len(resident_bytes)
-    covered_storage_ids = [set() for _ in resident_bytes]
+    intervals_by_storage = {}
     for candidate in candidates:
         start = max(0, candidate.start_interior)
-        end = min(len(resident_bytes) - 1, candidate.end_interior)
-        for op_id in range(start, end + 1):
-            if candidate.storage_id in covered_storage_ids[op_id]:
-                continue
-            covered_storage_ids[op_id].add(candidate.storage_id)
-            reducible_bytes[op_id] += candidate.size_bytes
+        end = min(len(resident_bytes), candidate.end_interior + 1)
+        if start < end:
+            intervals_by_storage.setdefault(candidate.storage_id, []).append((start, end, candidate.size_bytes))
+    delta = [0] * (len(resident_bytes) + 1)
+    for intervals in intervals_by_storage.values():
+        # A trace records one immutable physical size per storage ID.
+        size = intervals[0][2]
+        for start, end in merge_lifecycles([(start, end) for start, end, _ in intervals]):
+            delta[start] += size
+            delta[end] -= size
+    reducible_bytes = list(accumulate(delta[:-1]))
 
     peak_op = 0
     peak_unavoidable = 0
@@ -83,10 +89,11 @@ def select_peak_candidates(
 ) -> list[PeakCandidate]:
     """Select gap candidates until the simulated peak fits the budget."""
     selected_candidates: list[PeakCandidate] = []
+    edge_delta = [0] * (len(profile.edge_bytes) + 1)
     while True:
         peak = find_global_peak(profile.resident_bytes)
         if peak is None or peak[1] <= limit:
-            return selected_candidates
+            break
 
         peak_idx = effective_peak_index(
             PeakPlateauContext(
@@ -103,11 +110,20 @@ def select_peak_candidates(
         )
         if best is None:
             log_selection_exhaustion(peak, limit, len(selected_candidates))
-            return selected_candidates
+            break
 
         mark_candidate_selected(state, selected_candidates, best)
         apply_selection(profile.resident_bytes, best)
-        apply_edge_selection(profile.edge_bytes, best)
+        # Interior selection scores use only the op profile. Edge memory is
+        # consumed by the later boundary pass, so subtract its nonnegative
+        # deltas once instead of revisiting every edge for every selection.
+        start, end = max(0, best.release_start.op_id), min(len(profile.edge_bytes), best.end.op_id)
+        if start < end:
+            edge_delta[start] -= best.size_bytes
+            edge_delta[end] += best.size_bytes
+    for index, delta in enumerate(accumulate(edge_delta[:-1])):
+        profile.edge_bytes[index] = max(0, profile.edge_bytes[index] + delta)
+    return selected_candidates
 
 
 def mark_candidate_selected(
@@ -144,9 +160,9 @@ def has_covering_candidate(
 ) -> bool:
     """Return whether any unselected candidate can reduce ``peak_idx``."""
     return any(
-        candidate.selection_key not in selected_candidate_keys
-        and candidate.first_op_id < peak_idx
+        candidate.first_op_id < peak_idx
         and candidate.start_interior <= peak_idx <= candidate.end_interior
+        and candidate.selection_key not in selected_candidate_keys
         for candidate in candidates
     )
 
@@ -156,15 +172,15 @@ def select_best_candidate(
     state: SelectionState,
 ) -> PeakCandidate | None:
     """Pick the highest-scoring candidate that covers the current peak."""
+    peak = context.peak_idx
+    if not context.resident_bytes or peak >= len(context.resident_bytes) or context.resident_bytes[peak] <= 0:
+        return None
     eligible = [
         candidate
         for candidate in context.candidates
-        if is_candidate_eligible(
-            candidate,
-            state.selected_candidate_keys,
-            context.resident_bytes,
-            context.peak_idx,
-        )
+        if candidate.first_op_id < peak
+        and candidate.release_start.op_id < peak < candidate.end.op_id
+        and candidate.selection_key not in state.selected_candidate_keys
     ]
     if not eligible:
         return None
@@ -172,7 +188,10 @@ def select_best_candidate(
     score_context = CandidateScoreContext(
         peak_idx=context.peak_idx,
         normalizers=compute_score_normalizers(eligible, context.peak_idx),
-        selected_lifecycles=state.selected_lifecycles,
+        # The union is shared by every candidate in this selection round.
+        # Intersecting a candidate with this union is exactly equivalent to
+        # repeatedly clipping, sorting and merging the full history per score.
+        selected_lifecycles=merge_lifecycles(state.selected_lifecycles),
         weights=context.weights,
     )
     best: PeakCandidate | None = None
@@ -183,6 +202,19 @@ def select_best_candidate(
             best = candidate
             best_score = score
     return best
+
+
+def merge_lifecycles(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return the sorted union of half-open lifecycles without mutating input."""
+    merged = []
+    for start, end in sorted(intervals):
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def is_better_candidate(
@@ -206,11 +238,11 @@ def is_candidate_eligible(
     peak_idx: int,
 ) -> bool:
     """Return whether a candidate can reduce the current peak slot."""
-    if candidate.selection_key in selected_candidate_keys:
-        return False
     if candidate.first_op_id >= peak_idx:
         return False
     if not candidate.start_interior <= peak_idx <= candidate.end_interior:
+        return False
+    if candidate.selection_key in selected_candidate_keys:
         return False
     return peak_idx < len(resident_bytes) and resident_bytes[peak_idx] > 0
 
@@ -334,7 +366,8 @@ def compute_neighbor_impact(
 def apply_selection(resident_bytes: list[int], candidate: PeakCandidate) -> None:
     """Update the simulated profile for one selected candidate."""
     for op_id in range(candidate.start_interior, candidate.end_interior + 1):
-        resident_bytes[op_id] = max(0, resident_bytes[op_id] - candidate.size_bytes)
+        value = resident_bytes[op_id]
+        resident_bytes[op_id] = value - candidate.size_bytes if value > candidate.size_bytes else 0
 
 
 def apply_edge_selection(edge_bytes: list[int], candidate: PeakCandidate) -> None:

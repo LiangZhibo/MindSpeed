@@ -279,6 +279,33 @@ class TestResidencyManagerBind(unittest.TestCase):
         buf2 = self.manager.bind(2, torch.randn(2, 2))
         self.assertIsNot(buf1, buf2)
 
+    def test_alias_bind_preserves_full_storage_and_transfer_fences(self) -> None:
+        source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+        buffer = self.manager.bind(1, source)
+        original_view = buffer.device_buffer
+        host = source.flatten().view(torch.uint8).clone()
+        fences = [object(), object(), object()]
+        buffer.host_buffer = host
+        buffer.host_event, buffer.device_event, buffer.host_access_event = fences
+        alias = source[1:, ::2].transpose(0, 1)
+        self.assertIs(self.manager.bind(1, alias), buffer)
+        self.assertIs(buffer.device_buffer, original_view)
+        self.assertIs(buffer.host_buffer, host)
+        self.assertEqual([buffer.host_event, buffer.device_event, buffer.host_access_event], fences)
+        self.assertEqual(buffer.device_buffer.numel(), source.untyped_storage().nbytes())
+        torch.testing.assert_close(buffer.device_buffer, source.flatten().view(torch.uint8), rtol=0, atol=0)
+        buffer.host_event = buffer.device_event = buffer.host_access_event = None
+
+    def test_bind_refreshes_byte_extent_after_same_storage_resize(self) -> None:
+        source = torch.arange(4, dtype=torch.float32)
+        buffer = self.manager.bind(1, source)
+        storage_id = source.untyped_storage()._cdata
+        source.resize_(16).fill_(3)
+        self.assertEqual(source.untyped_storage()._cdata, storage_id)
+        self.manager.bind(1, source)
+        self.assertEqual(buffer.device_buffer.numel(), source.untyped_storage().nbytes())
+        torch.testing.assert_close(buffer.device_buffer, source.view(torch.uint8), rtol=0, atol=0)
+
     def test_resident_bytes_after_bind(self) -> None:
         t = torch.randn(8)  # 32 bytes (8 * 4)
         self.manager.bind(1, t)
@@ -584,6 +611,145 @@ class TestResidencyManagerTransitions(unittest.TestCase):
         self.assertIsNotNone(
             self.manager._residency[1].device_buffer
         )  # pylint: disable=protected-access
+
+
+class TestPrefetchAllocationStream(unittest.TestCase):
+    def test_deferred_release_keeps_copy_consumer_and_host_reuse_fences(self):
+        with _mock_accelerator_if_needed():
+            manager = ResidencyManager(1024, defer_h2d_release=True)
+            stream, consumer = _MockStream(), object()
+            manager._copy_stream = stream
+            host = manager._host_pool.acquire(64)
+            host.copy_(torch.arange(64, dtype=torch.uint8))
+            buffer = PhysicalBuffer(device=torch.device('cpu'), host_buffer=host)
+            manager._residency[1] = buffer
+            event = unittest.mock.Mock()
+            event.query.return_value = False
+            event.synchronize.side_effect = lambda: setattr(event.query, 'return_value', True)
+            recorded = []
+            with patch('torch.Event', return_value=event), \
+                 patch('torch.Tensor.record_stream', lambda tensor, owner: recorded.append(owner)), \
+                 patch('torch.accelerator.current_stream', return_value=consumer):
+                manager.copy_h2d(1)
+                buffer.device_storage()
+                torch.testing.assert_close(buffer.device_buffer, host, rtol=0, atol=0)
+                self.assertEqual(recorded, [stream, consumer])
+                event.wait.assert_called_once_with(consumer)
+                manager.release_device(1)
+                self.assertIsNone(buffer.device_buffer)
+                self.assertIs(buffer.device_event, event)
+                self.assertIs(buffer.host_reuse_event, event)
+                event.synchronize.assert_not_called()
+                manager.release_host(1)
+                self.assertNotIn(1, manager._residency)
+                self.assertIs(manager._host_pool._pending[1024][0][1], event)
+                # At capacity, the Host pool must still finish the old H2D
+                # reader before lending its bytes to a future writer.
+                reused = manager._host_pool.acquire(64)
+                event.synchronize.assert_called_once()
+                self.assertEqual(reused.data_ptr(), host.data_ptr())
+                torch.testing.assert_close(reused, torch.arange(64, dtype=torch.uint8), rtol=0, atol=0)
+
+    def test_deferred_release_waits_for_untracked_destinations(self):
+        manager = ResidencyManager(1024, defer_h2d_release=True)
+        event = unittest.mock.Mock()
+        buffer = PhysicalBuffer(device_buffer=torch.arange(8), device_event=event)
+        manager._residency[1] = buffer
+        manager.release_device(1)
+        event.synchronize.assert_called_once()
+        self.assertNotIn(1, manager._residency)
+
+    def test_deferred_release_preserves_live_shadow_consumer_event(self):
+        manager = ResidencyManager(1024, defer_h2d_release=True)
+        event = unittest.mock.Mock()
+        buffer = PhysicalBuffer(device_buffer=torch.arange(8), device_event=event,
+                                device_copy_stream_recorded=True)
+
+        class LiveAlias:
+            pass
+
+        alias = LiveAlias()
+        buffer.shadows.add(alias)
+        manager._residency[1] = buffer
+        manager.release_device(1)
+        self.assertNotIn(1, manager._residency)
+        self.assertIsNotNone(buffer.device_buffer)
+        consumer = object()
+        with patch('torch.accelerator.current_stream', return_value=consumer), \
+             patch('torch.Tensor.record_stream') as recorded:
+            buffer.device_storage()
+            event.wait.assert_called_once_with(consumer)
+            recorded.assert_called_once_with(consumer)
+        event.synchronize.assert_not_called()
+
+    def test_allocation_owner_and_consumer_lifetime_fences(self):
+        # CPU bytes check the data; explicit fake stream contexts check which
+        # allocator owns those bytes and which fences may safely be omitted.
+        for copy_owned in (False, True):
+            with self.subTest(copy_owned=copy_owned):
+                active = []
+                allocations = []
+                recorded = []
+
+                class Stream(_MockStream):
+                    def __enter__(self):
+                        active.append(self)
+                        return self
+
+                    def __exit__(self, *args):
+                        active.pop()
+
+                stream = Stream()
+                stream.wait_stream = unittest.mock.Mock()
+                producer = object()
+                host_event = unittest.mock.Mock()
+                event = unittest.mock.Mock()
+                host = torch.arange(64, dtype=torch.uint8)
+                manager = ResidencyManager(1024, prefetch_on_copy_stream=copy_owned)
+                manager._copy_stream = stream
+                buffer = PhysicalBuffer(device=torch.device('cpu'), host_buffer=host, host_event=host_event)
+                manager._residency[1] = buffer
+                original_empty = torch.empty
+
+                def allocate(*args, **kwargs):
+                    allocations.append(active[-1] if active else producer)
+                    return original_empty(*args, **kwargs)
+
+                with patch('torch.empty', allocate), patch('torch.Tensor.is_pinned', return_value=True), \
+                     patch('torch.Tensor.record_stream', lambda tensor, owner: recorded.append(owner)), \
+                     patch('torch.Event', return_value=event), \
+                     patch('torch.accelerator.current_stream', return_value=producer):
+                    manager.copy_h2d(1)
+                    self.assertEqual(allocations, [stream if copy_owned else producer])
+                    if copy_owned:
+                        stream.wait_stream.assert_not_called()
+                    else:
+                        stream.wait_stream.assert_called_once_with(producer)
+                    host_event.wait.assert_called_once_with(stream)
+                    event.record.assert_called_once_with(stream)
+                    self.assertIs(buffer.host_reuse_event, event)
+                    buffer.device_storage()
+                    event.wait.assert_called_once_with(producer)
+                    self.assertEqual(recorded, [stream, producer])
+                    torch.testing.assert_close(buffer.device_buffer, host, rtol=0, atol=0)
+
+    def test_failed_copy_stream_prefetch_keeps_host_reuse_fence(self):
+        manager = ResidencyManager(1024, prefetch_on_copy_stream=True)
+        stream = _MockStream()
+        stream.synchronize = unittest.mock.Mock()
+        manager._copy_stream = stream
+        buffer = PhysicalBuffer(device=torch.device('cpu'), host_buffer=torch.arange(64, dtype=torch.uint8))
+        manager._residency[1] = buffer
+        event = unittest.mock.Mock()
+        event.record.side_effect = RuntimeError('record failed after enqueue')
+        with patch('torch.Tensor.is_pinned', return_value=True), \
+             patch('torch.Tensor.record_stream'), patch('torch.Event', return_value=event), \
+             patch('torch.accelerator.current_stream', return_value=object()):
+            with self.assertRaisesRegex(RuntimeError, 'record failed'):
+                manager.copy_h2d(1)
+        stream.synchronize.assert_called_once()
+        self.assertIs(buffer.host_reuse_event, stream)
+        self.assertIsNone(buffer.device_buffer)
 
 
 class TestResidencyManagerClearAndSync(unittest.TestCase):

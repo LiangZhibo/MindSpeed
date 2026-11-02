@@ -44,3 +44,17 @@ def test_replay_trims_cache_before_entry():
         empty_cache.assert_called_once_with()
         wait_for_transfers.assert_called_once_with()
         assert session.last_trim_seconds >= 0.0
+
+
+def test_replay_can_retain_inactive_cache_without_skipping_executor_reset():
+    session = OffloadSession(OffloadConfig(trim_before_replay=False))
+    session.executor = ReplayExecutor(session.residency_manager, ResidencySchedule(), [])
+    session.mode = 'replay'
+    session.last_trim_seconds = 123.0
+    with patch('mindspeed.core.memory.hyper_offload.api.session._empty_accelerator_cache') as trim, \
+         patch.object(session.residency_manager, 'wait_for_transfers'), \
+         patch.object(session.executor, 'reset', wraps=session.executor.reset) as reset:
+        with session:
+            reset.assert_called_once_with()
+            assert session.last_trim_seconds == 0.0
+        trim.assert_not_called()

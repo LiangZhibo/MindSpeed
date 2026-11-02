@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 import torch
 
@@ -102,6 +101,51 @@ class TestReplayExecutor(unittest.TestCase):
 
     def test_initial_state(self) -> None:
         self.assertEqual(self.executor.op_idx, -1)
+
+    def test_after_offload_runs_once_after_final_prefetched_storage_release_each_replay(self):
+        schedule = ResidencySchedule()
+        for sid, begin in ((1, 0), (2, 2)):
+            schedule.add_post(begin, ResidencyActionType.COPY_D2H, sid)
+            schedule.add_post(begin, ResidencyActionType.RELEASE_DEVICE, sid)
+            schedule.add_pre(begin + 1, ResidencyActionType.COPY_H2D, sid)
+            schedule.add_pre(begin + 1, ResidencyActionType.RELEASE_HOST, sid)
+            schedule.add_post(begin + 1, ResidencyActionType.RELEASE_DEVICE, sid)
+        guide = [OpGuide(name="<lambda>", output_leaf_count=1) for _ in range(5)]
+        executor = ReplayExecutor(self.manager, schedule, guide,
+                                  after_offload=lambda: self.manager.calls.append('cleanup'))
+        for _ in range(2):
+            executor.reset()
+            self.manager.calls.clear()
+            self.manager.bind(1, torch.ones(1))
+            self.manager.bind(2, torch.ones(1))
+            for index in range(5):
+                executor.on_op_begin(lambda: None, (), {})
+                executor.on_op_end(torch.tensor(index))
+                self.assertEqual(self.manager.calls.count('cleanup'), int(index >= 3))
+                if index == 3:
+                    self.assertEqual(self.manager.calls[-2:], ['release_device(2)', 'cleanup'])
+            executor.finish()
+
+    def test_after_offload_skips_retained_or_later_prefetched_storage(self):
+        for future_prefetch in (False, True):
+            with self.subTest(future_prefetch=future_prefetch):
+                schedule = ResidencySchedule()
+                schedule.add_post(0, ResidencyActionType.COPY_D2H, 1)
+                schedule.add_post(0, ResidencyActionType.RELEASE_DEVICE, 1)
+                schedule.add_pre(1, ResidencyActionType.COPY_H2D, 1)
+                if future_prefetch:
+                    schedule.add_post(1, ResidencyActionType.RELEASE_DEVICE, 1)
+                    schedule.add_pre(2, ResidencyActionType.COPY_H2D, 1)
+                guide = [OpGuide(name="<lambda>", output_leaf_count=1) for _ in range(3)]
+                executor = ReplayExecutor(self.manager, schedule, guide,
+                                          after_offload=lambda: self.fail('storage has no final release'))
+                self.manager.bind(1, torch.ones(1))
+                for index in range(3):
+                    executor.on_op_begin(lambda: None, (), {})
+                    executor.on_op_end(torch.tensor(index))
+                executor.finish()
+        empty = ReplayExecutor(self.manager, ResidencySchedule(), guide, after_offload=lambda: None)
+        self.assertIsNone(empty._last_offload_release_op)
 
     def test_on_op_begin_increments_op_idx(self) -> None:
         self.executor.on_op_begin(lambda x: x, (torch.tensor(1.0),), {})
@@ -308,6 +352,7 @@ class TestReplayExecutorWithFakeManager(unittest.TestCase):
         ex.on_op_begin(lambda: None, (), {})
         wrapped = ex.on_op_end(result)
 
+        self.assertIsInstance(wrapped[1], ShadowTensor)
         self.assertEqual(manager.bound, [(7, result[1])])
         self.assertIn(7, ex.retained_sids)
 

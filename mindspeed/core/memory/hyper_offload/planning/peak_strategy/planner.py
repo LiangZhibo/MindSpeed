@@ -45,6 +45,8 @@ class PeakResidencyPlanner:
         *,
         weights: ScoreWeights | None = None,
         enable_communication_masking: bool = False,
+        transfer_window_scale: float | None = None,
+        limit_prefetch_window: bool = True,
         **score_weights: float,
     ) -> None:
         if weights is not None and score_weights:
@@ -53,6 +55,16 @@ class PeakResidencyPlanner:
         if not all(math.isfinite(value) for value in vars(self._weights).values()):
             raise ValueError("peak score weights must be finite")
         self._enable_communication_masking = enable_communication_masking
+        if transfer_window_scale is not None and (
+            not math.isfinite(transfer_window_scale) or transfer_window_scale < 0
+        ):
+            raise ValueError("transfer_window_scale must be finite and nonnegative")
+        if transfer_window_scale is not None and not enable_communication_masking:
+            raise ValueError("transfer windows require communication masking")
+        self._transfer_window_scale = transfer_window_scale
+        if not isinstance(limit_prefetch_window, bool):
+            raise ValueError('limit_prefetch_window must be a boolean')
+        self._limit_prefetch_window = limit_prefetch_window
 
     @staticmethod
     def _parse_score_weights(score_weights: dict[str, float]) -> ScoreWeights:
@@ -67,10 +79,7 @@ class PeakResidencyPlanner:
         if unknown_keys:
             raise TypeError(f"Unexpected score weight keyword(s): {sorted(unknown_keys)}")
 
-        values = {
-            field_name: score_weights.get(option_name, 1.0)
-            for option_name, field_name in allowed_keys.items()
-        }
+        values = {field_name: score_weights.get(option_name, 1.0) for option_name, field_name in allowed_keys.items()}
         return ScoreWeights(**values)
 
     def build(self, trace: ActivationTrace) -> ResidencySchedule:
@@ -99,12 +108,20 @@ class PeakResidencyPlanner:
         )
 
         if self._enable_communication_masking and selected_candidates:
+            time_prefix = [0.0]
+            for op in trace.ops:
+                time_prefix.append(time_prefix[-1] + float(op.duration_ms))
             masking_context = MaskingContext(
                 selected_candidates=selected_candidates,
                 resident_bytes=profile.resident_bytes,
                 limit=limit,
                 releasable=profile.releasable,
                 retained_sids=trace.retained_sids,
+                time_prefix_ms=time_prefix,
+                d2h_bandwidth_gbps=trace.d2h_bandwidth_gbps,
+                h2d_bandwidth_gbps=trace.h2d_bandwidth_gbps,
+                transfer_window_scale=self._transfer_window_scale,
+                limit_prefetch_window=self._limit_prefetch_window,
             )
             schedule, profile.resident_bytes = self._apply_communication_masking(masking_context)
         else:
