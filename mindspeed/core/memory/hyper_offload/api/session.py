@@ -19,6 +19,9 @@ from __future__ import annotations
 import contextvars
 import logging
 import sys
+import time
+
+import torch
 
 from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
@@ -29,6 +32,15 @@ from mindspeed.core.memory.hyper_offload.planning.greedy import GreedyResidencyP
 from mindspeed.core.memory.hyper_offload.runtime.residency import ResidencyManager
 
 logger = logging.getLogger(__name__)
+
+
+def _empty_accelerator_cache() -> None:
+    """Release inactive cache through the initialized accelerator backend."""
+    for name in ("npu", "cuda"):
+        backend = getattr(torch, name, None)
+        if backend is not None and backend.is_initialized():
+            backend.empty_cache()
+            return
 
 
 def _inside_fsdp_internal() -> bool:
@@ -88,6 +100,7 @@ class OffloadSession:
         self._dispatch_context = None
         self._session_token = None
         self._cleanup_failed = False
+        self.last_trim_seconds = 0.0
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)
@@ -108,6 +121,11 @@ class OffloadSession:
             raise RuntimeError("nested OffloadSession contexts are unsupported")
         if self._cleanup_failed:
             raise RuntimeError("cannot reuse OffloadSession after a cleanup failure")
+        self.last_trim_seconds = 0.0
+        if self.mode == "replay":
+            trim_started = time.perf_counter()
+            _empty_accelerator_cache()
+            self.last_trim_seconds = time.perf_counter() - trim_started
         self.executor.reset()
 
         dispatch_context = ActivationDispatchMode(self)
