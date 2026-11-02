@@ -26,8 +26,21 @@ def test_replay_trims_cache_before_entry():
     session.executor = ReplayExecutor(session.residency_manager, ResidencySchedule(), [])
     session.mode = "replay"
 
-    with patch("mindspeed.core.memory.hyper_offload.api.session._empty_accelerator_cache") as empty_cache:
+    original_reset = session.executor.reset
+
+    def reset_after_trim():
+        empty_cache.assert_called_once_with()
+        original_reset()
+
+    # Transfer-stream synchronization is independent of cache trimming and
+    # must be mocked so that exiting the session also works on CPU-only hosts.
+    with (
+        patch("mindspeed.core.memory.hyper_offload.api.session._empty_accelerator_cache") as empty_cache,
+        patch.object(session.residency_manager, "wait_for_transfers") as wait_for_transfers,
+        patch.object(session.executor, "reset", side_effect=reset_after_trim),
+    ):
         with session:
             empty_cache.assert_called_once_with()
         empty_cache.assert_called_once_with()
+        wait_for_transfers.assert_called_once_with()
         assert session.last_trim_seconds >= 0.0
