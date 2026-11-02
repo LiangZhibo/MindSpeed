@@ -225,6 +225,15 @@ class ResidencyManager:
         it to a new :class:`~offload.execution.tensor.ShadowTensor`.
         """
         storage = tensor.untyped_storage()
+        buffer = self._residency.get(sid)
+        if buffer is not None and buffer.device_buffer is not None:
+            current = buffer.device_buffer
+            # Aliased outputs already share the full-storage byte view. Reuse
+            # it without retaining another tensor or changing transfer fences.
+            # A storage can grow without changing identity, so check its size.
+            if (current.untyped_storage()._cdata == storage._cdata
+                    and current.numel() == storage.nbytes()):
+                return buffer
         dev_view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
         dev_view.set_(storage, 0, (storage.size(),), (1,))
         if sid not in self._residency:

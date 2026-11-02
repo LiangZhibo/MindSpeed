@@ -319,6 +319,9 @@ class BaseExecutor(ABC):
 
         """
         self._validate_input_ownership((result,), {})
+        if not bindings:
+            self._last_output_bindings = bindings
+            return result
         leaves, tree_spec = tree_flatten(result)
         shadowed = list(leaves)
         for idx, leaf in enumerate(leaves):

@@ -279,6 +279,33 @@ class TestResidencyManagerBind(unittest.TestCase):
         buf2 = self.manager.bind(2, torch.randn(2, 2))
         self.assertIsNot(buf1, buf2)
 
+    def test_alias_bind_preserves_full_storage_and_transfer_fences(self) -> None:
+        source = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+        buffer = self.manager.bind(1, source)
+        original_view = buffer.device_buffer
+        host = source.flatten().view(torch.uint8).clone()
+        fences = [object(), object(), object()]
+        buffer.host_buffer = host
+        buffer.host_event, buffer.device_event, buffer.host_access_event = fences
+        alias = source[1:, ::2].transpose(0, 1)
+        self.assertIs(self.manager.bind(1, alias), buffer)
+        self.assertIs(buffer.device_buffer, original_view)
+        self.assertIs(buffer.host_buffer, host)
+        self.assertEqual([buffer.host_event, buffer.device_event, buffer.host_access_event], fences)
+        self.assertEqual(buffer.device_buffer.numel(), source.untyped_storage().nbytes())
+        torch.testing.assert_close(buffer.device_buffer, source.flatten().view(torch.uint8), rtol=0, atol=0)
+        buffer.host_event = buffer.device_event = buffer.host_access_event = None
+
+    def test_bind_refreshes_byte_extent_after_same_storage_resize(self) -> None:
+        source = torch.arange(4, dtype=torch.float32)
+        buffer = self.manager.bind(1, source)
+        storage_id = source.untyped_storage()._cdata
+        source.resize_(16).fill_(3)
+        self.assertEqual(source.untyped_storage()._cdata, storage_id)
+        self.manager.bind(1, source)
+        self.assertEqual(buffer.device_buffer.numel(), source.untyped_storage().nbytes())
+        torch.testing.assert_close(buffer.device_buffer, source.view(torch.uint8), rtol=0, atol=0)
+
     def test_resident_bytes_after_bind(self) -> None:
         t = torch.randn(8)  # 32 bytes (8 * 4)
         self.manager.bind(1, t)

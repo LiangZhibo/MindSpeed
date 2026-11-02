@@ -23,11 +23,14 @@ Physical state transitions are delegated to
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
+import torch
 from torch.utils._pytree import tree_flatten
 
 from mindspeed.core.memory.hyper_offload.execution.base import BaseExecutor
+from mindspeed.core.memory.hyper_offload.execution.tensor import ShadowTensor
 from mindspeed.core.memory.hyper_offload.execution.validation import input_bindings, op_identity, signature
 from mindspeed.core.memory.hyper_offload.ir.replay import OpGuide
 from mindspeed.core.memory.hyper_offload.ir.schedule import ResidencyActionType, ResidencySchedule
@@ -52,6 +55,73 @@ class ReplayExecutor(BaseExecutor):
         super().__init__(residency_manager)
         self._schedule = schedule
         self._guide = guide
+        # A complete guide permits native ownership for storages which neither
+        # move nor require subclass identity at an autograd boundary. In Torch
+        # 2.7, AccumulateGrad detaches a wrapper gradient twice but a native one
+        # once. Preserve detach inputs as shadows so replay keeps the exact
+        # operator stream and schedule indices recorded during warmup.
+        # Keep legacy hand-built guides on their original contract.
+        self._managed_sids = None if any(
+            op.input_signature is None or op.output_signature is None for op in guide
+        ) else {
+            action.storage_id
+            for phase in (schedule.pre, schedule.post)
+            for actions in phase.values()
+            for action in actions
+            if action.kind in (ResidencyActionType.COPY_D2H, ResidencyActionType.COPY_H2D)
+        }
+        if self._managed_sids is not None:
+            self._managed_sids.update(
+                sid
+                for op in guide if op.name == "aten.detach.default"
+                for sid in op.input_bindings.values()
+            )
+        def managed(bindings):
+            if self._managed_sids is None:
+                return bindings
+            return {index: sid for index, sid in bindings.items() if sid in self._managed_sids}
+        self._replay_output_bindings = [managed(op.output_bindings) for op in guide]
+        # Mirror the identity carried by each shadow, not every raw alias of
+        # its storage. FSDP can deliberately create an untracked native view
+        # while dispatch modes are disabled; warmup does not bind that view.
+        # Weak tensor references neither retain activations nor run Tensor.eq.
+        # Dead entries are harmless (identity is checked) and cleared per step.
+        self._native_sids = {}
+
+    def reset(self) -> None:
+        super().reset()
+        self._native_sids.clear()
+
+    def _input_bindings(self, args, kwargs):
+        if self._managed_sids is None:
+            return input_bindings(args, kwargs)
+        bindings = {}
+        for index, value in enumerate(tree_flatten((args, kwargs))[0]):
+            if isinstance(value, ShadowTensor):
+                bindings[index] = value.storage_id
+            elif isinstance(value, torch.Tensor):
+                entry = self._native_sids.get(id(value))
+                if entry is not None and entry[0]() is value:
+                    bindings[index] = entry[1]
+        return bindings
+
+    def _register_native_bindings(self, leaves, bindings):
+        if self._managed_sids is not None:
+            for index, sid in bindings.items():
+                if sid not in self._managed_sids:
+                    value = leaves[index]
+                    self._native_sids[id(value)] = (weakref.ref(value), sid)
+
+    def execute_opaque_op(self, func_name, fn, args, kwargs):
+        nested = self.in_opaque_region
+        result = super().execute_opaque_op(func_name, fn, args, kwargs)
+        if not nested:
+            # Autograd's custom-Function boundary may return a new Tensor
+            # object. Register its final identity, as shadow fixup does.
+            self._register_native_bindings(
+                tree_flatten(result)[0], self._guide[self.op_idx].output_bindings
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -76,9 +146,15 @@ class ReplayExecutor(BaseExecutor):
             )
         if guide.input_signature is not None and (
             signature((args, kwargs)) != guide.input_signature
-            or input_bindings(args, kwargs) != guide.input_bindings
+            or self._input_bindings(args, kwargs) != guide.input_bindings
         ):
-            raise RuntimeError(f"replay input metadata or bindings differ at op={self.op_idx}")
+            raise RuntimeError(
+                f"replay input metadata or bindings differ at op={self.op_idx}: "
+                f"name={guide.name}, "
+                f"metadata_equal={signature((args, kwargs)) == guide.input_signature}, "
+                f"expected_bindings={guide.input_bindings}, "
+                f"actual_bindings={self._input_bindings(args, kwargs)}"
+            )
 
         for action in self._schedule.pre_actions(self.op_idx):
             if action.kind == ResidencyActionType.COPY_H2D:
@@ -118,7 +194,8 @@ class ReplayExecutor(BaseExecutor):
             (self._last_args, self._last_kwargs, result), scalar_values=False
         ) != op_guide.output_signature:
             raise RuntimeError(f"replay output metadata or aliases differ at op={self.op_idx}")
-        result = self.apply_shadows(result, op_guide.output_bindings)
+        self._register_native_bindings(leaves, op_guide.output_bindings)
+        result = self.apply_shadows(result, self._replay_output_bindings[self.op_idx])
 
         # 2. Execute post-actions (COPY_D2H, RELEASE_DEVICE, RELEASE_HOST).
         for action in self._schedule.post_actions(self.op_idx):
@@ -126,7 +203,8 @@ class ReplayExecutor(BaseExecutor):
             if action.kind == ResidencyActionType.COPY_D2H:
                 self.residency_manager.copy_d2h(sid)
             elif action.kind == ResidencyActionType.RELEASE_DEVICE:
-                self.residency_manager.release_device(sid)
+                if self._managed_sids is None or sid in self._managed_sids:
+                    self.residency_manager.release_device(sid)
             elif action.kind == ResidencyActionType.RELEASE_HOST:
                 self.residency_manager.release_host(sid)
             else:
