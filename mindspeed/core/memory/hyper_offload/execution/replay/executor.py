@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import Any
+from typing import Any, Callable
 
 import torch
+from torch.utils._python_dispatch import _disable_current_modes
 from torch.utils._pytree import tree_flatten
 
 from mindspeed.core.memory.hyper_offload.execution.base import BaseExecutor
@@ -51,10 +52,36 @@ class ReplayExecutor(BaseExecutor):
         residency_manager: ResidencyManager,
         schedule: ResidencySchedule,
         guide: list[OpGuide],
+        *,
+        after_offload: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(residency_manager)
         self._schedule = schedule
         self._guide = guide
+        self._after_offload = after_offload
+        self._after_offload_called = False
+        self._last_offload_release_op = None
+        if after_offload is not None:
+            # Pick one fixed replay boundary after every transferred storage's
+            # final prefetch and scheduled device release. If some transferred
+            # storage remains live in the schedule, do not invent a boundary.
+            prefetched = {}
+            for index, actions in schedule.pre.items():
+                for action in actions:
+                    if action.kind == ResidencyActionType.COPY_H2D:
+                        prefetched[action.storage_id] = max(index, prefetched.get(action.storage_id, -1))
+            copied, released = {}, {}
+            for index, actions in schedule.post.items():
+                for action in actions:
+                    sid = action.storage_id
+                    if action.kind == ResidencyActionType.COPY_D2H:
+                        copied[sid] = max(index, copied.get(sid, -1))
+                    elif action.kind == ResidencyActionType.RELEASE_DEVICE and sid in prefetched:
+                        if index >= prefetched[sid]:
+                            released[sid] = max(index, released.get(sid, -1))
+            if (copied and set(copied) == set(prefetched) == set(released)
+                    and all(prefetched[sid] > index for sid, index in copied.items())):
+                self._last_offload_release_op = max(released.values())
         # A complete guide permits native ownership for storages which neither
         # move nor require subclass identity at an autograd boundary. In Torch
         # 2.7, AccumulateGrad detaches a wrapper gradient twice but a native one
@@ -91,6 +118,7 @@ class ReplayExecutor(BaseExecutor):
     def reset(self) -> None:
         super().reset()
         self._native_sids.clear()
+        self._after_offload_called = False
 
     def _input_bindings(self, args, kwargs):
         if self._managed_sids is None:
@@ -112,9 +140,10 @@ class ReplayExecutor(BaseExecutor):
                     value = leaves[index]
                     self._native_sids[id(value)] = (weakref.ref(value), sid)
 
-    def execute_opaque_op(self, func_name, fn, args, kwargs):
+    def execute_opaque_op(self, func_name, fn, args, kwargs, *, track_backward_inputs=False):
         nested = self.in_opaque_region
-        result = super().execute_opaque_op(func_name, fn, args, kwargs)
+        result = super().execute_opaque_op(func_name, fn, args, kwargs,
+                                         track_backward_inputs=track_backward_inputs)
         if not nested:
             # Autograd's custom-Function boundary may return a new Tensor
             # object. Register its final identity, as shadow fixup does.
@@ -209,6 +238,13 @@ class ReplayExecutor(BaseExecutor):
                 self.residency_manager.release_host(sid)
             else:
                 raise RuntimeError(f"unsupported post action {action} at op={self.op_idx}")
+
+        if self.op_idx == self._last_offload_release_op and not self._after_offload_called:
+            # Runtime housekeeping must never become a recorded model op.
+            # Live tensor storage and allocator stream fences remain intact.
+            self._after_offload_called = True
+            with _disable_current_modes():
+                self._after_offload()
 
         return result
 

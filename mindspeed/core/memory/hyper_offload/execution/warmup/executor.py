@@ -139,6 +139,8 @@ class WarmupExecutor(BaseExecutor):
 
         # --- Detect mutated (write) input tensors via func._schema ---
         mutated_tensor_ids = {id(t) for t in mutated_tensors(func, args, kwargs)}
+        if getattr(func, '_hyper_offload_invalidates_inputs', False):
+            mutated_tensor_ids.update(id(t) for t in iter_tensors((args, kwargs)))
 
         seen: set[tuple[int, AccessKind]] = set()
 

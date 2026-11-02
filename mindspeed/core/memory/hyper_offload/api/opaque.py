@@ -30,15 +30,22 @@ from mindspeed.core.memory.hyper_offload.api.session import OffloadSession
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def skip_offload(fn: F) -> F:
+def skip_offload(fn: F, *, track_backward_inputs: bool = False) -> F:
     """Decorate a callable as a virtual op offload region.
 
     The decorator wraps the function execution into a single "virtual op"
     in the execution trace, while suspending fine-grained tracing for
     internal operations.
+
+    ``track_backward_inputs`` declares that the opaque backward will read its
+    forward ShadowTensor inputs. Checkpoint callers must save those inputs
+    outside this opaque boundary so the storage planner can actually evict
+    them; ordinary native autograd saves do not provide that guarantee.
     """
     if not callable(fn):
         raise TypeError("skip_offload only supports decorator usage")
+    if not isinstance(track_backward_inputs, bool):
+        raise TypeError('track_backward_inputs must be a boolean')
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -49,6 +56,8 @@ def skip_offload(fn: F) -> F:
 
         target = fn.func if isinstance(fn, functools.partial) else fn
         name = getattr(target, "__qualname__", type(target).__qualname__)
+        if track_backward_inputs:
+            return session.executor.execute_opaque_op(name, fn, args, kwargs, track_backward_inputs=True)
         return session.executor.execute_opaque_op(name, fn, args, kwargs)
 
     return wrapper

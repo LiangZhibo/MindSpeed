@@ -67,7 +67,8 @@ class OpaqueRegionEnd(torch.autograd.Function):
     """Autograd function to mark the end of an opaque region."""
 
     @staticmethod
-    def forward(ctx: Any, executor: BaseExecutor, func_name: str, dummy: torch.Tensor, *outputs: Any) -> Any:  # pylint: disable=unused-argument
+    def forward(ctx: Any, executor: BaseExecutor, func_name: str, backward_inputs: tuple,
+                dummy: torch.Tensor, *outputs: Any) -> Any:  # pylint: disable=unused-argument
         """Forward pass for the end boundary.
 
         Wraps raw tensors into :class:`ShadowTensor` **inside** the
@@ -79,6 +80,11 @@ class OpaqueRegionEnd(torch.autograd.Function):
         """
         ctx.executor = executor
         ctx.func_name = func_name
+        # Managed inputs stay logical ShadowTensor references. Replay may keep
+        # other inputs native when their storage never needs to move.
+        # They are cleared at backward entry instead of retaining buffers until
+        # the output graph itself is destroyed after the training step.
+        ctx.backward_inputs = backward_inputs
         ctx.generation = executor._generation
         ctx.set_materialize_grads(False)
         # 'outputs' is a flat tuple of tensors passed via .apply(*flat_res).
@@ -87,7 +93,8 @@ class OpaqueRegionEnd(torch.autograd.Function):
         # pylint: disable=protected-access
         wrapped = tuple(executor.apply_shadows(outputs, executor._last_output_bindings))
         non_differentiable = [
-            value for original, value in zip(outputs, wrapped)
+            value
+            for original, value in zip(outputs, wrapped)
             if isinstance(original, torch.Tensor) and not original.requires_grad
         ]
         if non_differentiable:
@@ -105,10 +112,13 @@ class OpaqueRegionEnd(torch.autograd.Function):
 
         bwd_dummy.__name__ = ctx.func_name + "_bwd"
 
-        executor.on_op_begin(bwd_dummy, grad_outputs, {})
+        backward_inputs = ctx.backward_inputs
+        ctx.backward_inputs = ()
+        inputs = (grad_outputs, backward_inputs) if backward_inputs else grad_outputs
+        executor.on_op_begin(bwd_dummy, inputs, {})
 
         executor.enter_opaque_region()
-        return (None, None, torch.zeros(1)) + grad_outputs
+        return (None, None, None, torch.zeros(1)) + grad_outputs
 
 
 class BaseExecutor(ABC):
@@ -158,7 +168,8 @@ class BaseExecutor(ABC):
         if not self._session_active or self._generation != generation:
             raise RuntimeError("opaque backward must run inside its originating session scope")
 
-    def execute_opaque_op(self, func_name: str, fn: Callable, args: tuple, kwargs: dict) -> Any:
+    def execute_opaque_op(self, func_name: str, fn: Callable, args: tuple, kwargs: dict, *,
+                          track_backward_inputs: bool = False) -> Any:
         """Execute a function as a single virtual op.
 
         Wraps the function execution into a single "virtual op" in the
@@ -187,6 +198,11 @@ class BaseExecutor(ABC):
             """Dummy forward function that records the op boundary."""
 
         fwd_dummy.__name__ = func_name + "_fwd"
+        # The runtime retires input Host snapshots below, even for a callable
+        # whose body happens to be read-only. Trace this as a version boundary
+        # so a replay plan cannot copy before the region and prefetch a retired
+        # snapshot after it. Opaque callables have no trustworthy write schema.
+        fwd_dummy._hyper_offload_invalidates_inputs = True
 
         self.enter_opaque_region()
         try:
@@ -200,6 +216,8 @@ class BaseExecutor(ABC):
             # Inject a dummy tensor to ensure backward graph continuity
             dummy = torch.zeros(1, requires_grad=True)
             flat_args, spec_args = tree_flatten((args, kwargs))
+            backward_inputs = tuple(value for value in flat_args if isinstance(value, torch.Tensor)) \
+                if track_backward_inputs else ()
 
             # Boundary 1: Wrap inputs to delay backward virtual step exit
             out_start = OpaqueRegionStart.apply(self, func_name, dummy, *flat_args)
@@ -217,7 +235,7 @@ class BaseExecutor(ABC):
             # happen inside the autograd Function for the engine to
             # correctly link ShadowTensor subclasses into the graph).
             flat_res, spec_res = tree_flatten(result)
-            out_end = OpaqueRegionEnd.apply(self, func_name, dummy_out, *flat_res)
+            out_end = OpaqueRegionEnd.apply(self, func_name, backward_inputs, dummy_out, *flat_res)
             result_unflat = tree_unflatten(out_end, spec_res)
         finally:
             self.exit_opaque_region()

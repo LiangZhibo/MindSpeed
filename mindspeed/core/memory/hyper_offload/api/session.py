@@ -52,6 +52,7 @@ def _inside_fsdp_internal() -> bool:
         frame = frame.f_back
     return False
 
+
 # Context variable tracking the active OffloadSession (set on __enter__).
 _active_session: contextvars.ContextVar[OffloadSession | None] = contextvars.ContextVar("_active_session", default=None)
 
@@ -101,6 +102,7 @@ class OffloadSession:
         self._session_token = None
         self._cleanup_failed = False
         self.last_trim_seconds = 0.0
+        self.trim_before_replay = config.trim_before_replay
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)
@@ -122,7 +124,7 @@ class OffloadSession:
         if self._cleanup_failed:
             raise RuntimeError("cannot reuse OffloadSession after a cleanup failure")
         self.last_trim_seconds = 0.0
-        if self.mode == "replay":
+        if self.mode == "replay" and self.trim_before_replay:
             trim_started = time.perf_counter()
             _empty_accelerator_cache()
             self.last_trim_seconds = time.perf_counter() - trim_started

@@ -172,6 +172,13 @@ class MaskingContext:
     limit: float
     releasable: dict[int, StorageAccess]
     retained_sids: set[int]
+    # Optional calibrated compute timeline and transfer windows. None preserves
+    # the existing maximum-distance masking policy exactly.
+    time_prefix_ms: list[float] | None = None
+    d2h_bandwidth_gbps: float = 16.0
+    h2d_bandwidth_gbps: float = 16.0
+    transfer_window_scale: float | None = None
+    limit_prefetch_window: bool = True
 
 
 @dataclass(frozen=True)

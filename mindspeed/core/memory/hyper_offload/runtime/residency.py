@@ -83,6 +83,9 @@ class PhysicalBuffer:
     shadows: weakref.WeakSet = field(default_factory=weakref.WeakSet, repr=False, compare=False)
     """Live aliases, including views created outside the dispatch session."""
 
+    device_copy_stream_recorded: bool = False
+    """The current destination's allocator lifetime includes its H2D stream."""
+
     def prepare_for_write(self) -> None:
         """Restore device data and retire its host snapshot before a mutation."""
         # D2H may still be reading the device storage being modified.
@@ -132,6 +135,7 @@ class PhysicalBuffer:
                 dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=self.device)
                 dev_bytes.copy_(self.host_buffer, non_blocking=False)
                 self.device_buffer = dev_bytes
+                self.device_copy_stream_recorded = False
             else:
                 raise RuntimeError(
                     "No device buffer available and cannot demand-page. "
@@ -161,8 +165,12 @@ class ResidencyManager:
         self,
         max_host_bytes: int,
         allow_pageable_fallback: bool = False,
+        prefetch_on_copy_stream: bool = False,
+        defer_h2d_release: bool = False,
     ) -> None:
         self._copy_stream = None
+        self.prefetch_on_copy_stream = prefetch_on_copy_stream
+        self.defer_h2d_release = defer_h2d_release
         self._host_pool = PinnedMemoryPool(max_host_bytes, allow_pageable_fallback)
         self._residency: dict[int, PhysicalBuffer] = {}
 
@@ -231,8 +239,7 @@ class ResidencyManager:
             # Aliased outputs already share the full-storage byte view. Reuse
             # it without retaining another tensor or changing transfer fences.
             # A storage can grow without changing identity, so check its size.
-            if (current.untyped_storage()._cdata == storage._cdata
-                    and current.numel() == storage.nbytes()):
+            if current.untyped_storage()._cdata == storage._cdata and current.numel() == storage.nbytes():
                 return buffer
         dev_view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
         dev_view.set_(storage, 0, (storage.size(),), (1,))
@@ -247,6 +254,7 @@ class ResidencyManager:
             buffer.host_event = None
             buffer.host_access_event = None
             buffer.device_event = None
+            buffer.device_copy_stream_recorded = False
         buffer.device = tensor.device
         buffer.device_buffer = dev_view
         return buffer
@@ -266,16 +274,12 @@ class ResidencyManager:
         """
         buffer = self._residency.get(sid)
         if buffer is None:
-            raise RuntimeError(
-                f"copy_d2h sid={sid}: no physical buffer registered"
-            )
+            raise RuntimeError(f"copy_d2h sid={sid}: no physical buffer registered")
         if buffer.host_buffer is not None:
             logger.debug("copy_d2h sid=%d: already on host, skip", sid)
             return
         if buffer.device_buffer is None:
-            raise RuntimeError(
-                f"copy_d2h sid={sid}: no device data to copy"
-            )
+            raise RuntimeError(f"copy_d2h sid={sid}: no device data to copy")
 
         dev_src = buffer.device_buffer
         size_bytes = dev_src.numel()
@@ -353,23 +357,17 @@ class ResidencyManager:
         """
         buffer = self._residency.get(sid)
         if buffer is None:
-            raise RuntimeError(
-                f"copy_h2d sid={sid}: no physical buffer registered"
-            )
+            raise RuntimeError(f"copy_h2d sid={sid}: no physical buffer registered")
 
         if buffer.device_buffer is not None:
             logger.debug("copy_h2d sid=%d: already on device, skip", sid)
             return
 
         if buffer.host_buffer is None:
-            raise RuntimeError(
-                f"copy_h2d sid={sid}: no host data to copy"
-            )
+            raise RuntimeError(f"copy_h2d sid={sid}: no host data to copy")
 
         if buffer.device is None:
-            raise RuntimeError(
-                f"copy_h2d sid={sid}: target device unknown"
-            )
+            raise RuntimeError(f"copy_h2d sid={sid}: target device unknown")
 
         size_bytes = buffer.host_buffer.numel()
         logger.debug(
@@ -380,11 +378,22 @@ class ResidencyManager:
             buffer.device,
         )
 
-        # 1. Allocate device memory.
-        dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=buffer.device)
-
-        # 2. Launch async H2D copy (wait for prior D2H event if present).
         copy_stream = self._get_copy_stream()
+        # Allocate on the copy stream only when it will own the async copy.
+        # Its allocator reuse is then ordered by that same stream; no dependency
+        # on unrelated work already queued on the compute stream is necessary.
+        # Consumers still wait on device_event and record their stream below
+        # in PhysicalBuffer.device_storage().
+        copy_owned = (
+            self.prefetch_on_copy_stream and buffer.host_buffer.is_pinned() and buffer.device == copy_stream.device
+        )
+        if copy_owned:
+            with copy_stream:
+                dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=buffer.device)
+        else:
+            dev_bytes = torch.empty(size_bytes, dtype=torch.uint8, device=buffer.device)
+
+        # Launch H2D, preserving both Host reuse and destination reuse fences.
         event = None
         try:
             if not buffer.host_buffer.is_pinned():
@@ -405,7 +414,8 @@ class ResidencyManager:
                 producer_stream = torch.accelerator.current_stream()
                 event = torch.Event()
                 with copy_stream:
-                    copy_stream.wait_stream(producer_stream)
+                    if not copy_owned:
+                        copy_stream.wait_stream(producer_stream)
                     if buffer.host_event is not None:
                         buffer.host_event.wait(copy_stream)
                     dev_bytes.copy_(buffer.host_buffer, non_blocking=True)
@@ -422,6 +432,7 @@ class ResidencyManager:
         # 3. Update physical buffer.
         buffer.device_buffer = dev_bytes
         buffer.device_event = event
+        buffer.device_copy_stream_recorded = event is not None
         buffer.host_access_event = event
 
     # ------------------------------------------------------------------
@@ -431,8 +442,11 @@ class ResidencyManager:
     def release_device(self, sid: int) -> None:
         """Release device-resident bytes for a storage ID.
 
-        Frees the device buffer. If an H2D prefetch is still in flight,
-        waits for it before dropping the destination buffer reference.
+        Normally waits for an in-flight H2D before dropping the destination.
+        With deferred release enabled, destinations whose copy stream was
+        recorded can instead rely on allocator stream fences. Consumers also
+        record their stream in ``device_storage``; Host recycling retains the
+        H2D reader event independently. Untracked destinations still wait.
         Pending D2H copies are protected by ``record_stream`` during
         ``copy_d2h``.
         """
@@ -440,7 +454,9 @@ class ResidencyManager:
         if buffer is None or buffer.device_buffer is None:
             return
 
-        if buffer.device_event is not None:
+        if buffer.device_event is not None and not (
+            self.defer_h2d_release and buffer.device_copy_stream_recorded
+        ):
             buffer.device_event.synchronize()
             buffer.device_event = None
 
@@ -451,6 +467,7 @@ class ResidencyManager:
             del self._residency[sid]
             return
         buffer.device_buffer = None
+        buffer.device_copy_stream_recorded = False
         if buffer.host_buffer is None:
             del self._residency[sid]
 
