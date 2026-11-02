@@ -47,11 +47,13 @@ def apply_hccl_premul_sum_patch():
                 output = args[0] if args else kwargs[output_name]
                 output.data.mul_(factor)
             return handle
+
         return wrapped
 
     dist.all_reduce = wrap(dist.all_reduce, "tensor")
     dist.reduce_scatter = wrap(dist.reduce_scatter, "output")
     dist.reduce_scatter_tensor = wrap(dist.reduce_scatter_tensor, "output")
+
 
 opaque_chunk_loss = skip_offload(chunk_loss)
 
@@ -65,8 +67,7 @@ class ChunkedHead(torch.nn.Module):
     def forward(self, hidden, labels):
         normalizer = torch.tensor(labels.numel(), dtype=torch.float32, device=hidden.device)
         loss_kwargs = [
-            dict(shift_labels=part, alpha=normalizer, reduction="sum")
-            for part in labels.split(self.chunk_size, dim=1)
+            dict(shift_labels=part, alpha=normalizer, reduction="sum") for part in labels.split(self.chunk_size, dim=1)
         ]
         return opaque_chunk_loss(hidden, self.weight, None, calculate_lm_loss, loss_kwargs, self.chunk_size)
 
@@ -97,6 +98,38 @@ def parse_args():
     parser.add_argument("--offload-host-mb", type=int, default=32768)
     parser.add_argument("--offload-planner", choices=("peak", "greedy"), default="peak")
     parser.add_argument("--offload-communication-masking", action="store_true")
+    parser.add_argument("--hyper-offload-autotune", action="store_true")
+    parser.add_argument("--offload-tuning-steps", type=int, default=10)
+    parser.add_argument("--offload-tuning-candidates", type=int, default=3)
+    parser.add_argument("--offload-window-probe-multiplier", type=float, default=8.0)
+    parser.add_argument("--offload-window-probe-unlimited-prefetch", action="store_true")
+    parser.add_argument(
+        "--offload-tuning-probe",
+        choices=(
+            "norm",
+            "mlp",
+            "attention_resident",
+            "suffix_resident",
+            "mlp_resident",
+            "compute_resident",
+            "budget_resident",
+            "stream_resident",
+            "cache_resident",
+            "pointwise_resident",
+            "pointwise_window_resident",
+            "gate_recompute_resident",
+            "placement_resident",
+            "window_resident",
+            "release_resident",
+            "partial_compute_resident",
+            "gate_compute_resident",
+            "phase_trim_resident",
+            "phase_cache_resident",
+        ),
+        default="norm",
+    )
+    parser.add_argument("--offload-resident-mlp-fraction", type=float, default=0.5)
+    parser.add_argument("--offload-tuning-device-peak-mb", type=int)
     parser.add_argument("--extra-steps", type=int, default=0)
     parser.add_argument("--use-torch-fsdp2", action="store_true", required=True)
     parser.add_argument("--fsdp2-config-path", required=True)
@@ -152,17 +185,23 @@ def make_engine(args, rank):
         sub_modules_to_wrap={Qwen2DecoderLayer, torch.nn.Embedding, ChunkedHead},
         process_group=dist.group.WORLD,
     )
-    if recompute_layers:
+    if recompute_layers and not args.hyper_offload_autotune:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-            CheckpointImpl, checkpoint_wrapper,
+            CheckpointImpl,
+            checkpoint_wrapper,
         )
+
         for index in range(recompute_layers):
             training_model.model.layers[index] = checkpoint_wrapper(
                 training_model.model.layers[index], checkpoint_impl=CheckpointImpl.NO_REENTRANT
             )
-    if args.hyper_offload:
+    if args.hyper_offload and not args.hyper_offload_autotune:
         for layer in engine.module.model.layers[:recompute_layers]:
             layer.forward = skip_offload(layer.forward)
+    if args.hyper_offload_autotune:
+        from mindspeed.core.memory.hyper_offload.tuning.regions import qwen_recompute_regions
+
+        engine._hyper_offload_regions = qwen_recompute_regions(engine.module.model.layers)
     log(
         rank,
         "ENGINE_READY "
@@ -171,10 +210,13 @@ def make_engine(args, rank):
         f"hyper_offload={args.hyper_offload}",
     )
     import mindspeed
+
     adapter_path = Path(inspect.getfile(TorchFullyShardedDataParallel.__init__)).resolve()
     mindspeed_root = Path(mindspeed.__file__).resolve().parent
-    expected_adapter = (mindspeed_root / "core/distributed/torch_fully_sharded_data_parallel/"
-                        "torch_fully_sharded_data_parallel_adaptor.py")
+    expected_adapter = (
+        mindspeed_root / "core/distributed/torch_fully_sharded_data_parallel/"
+        "torch_fully_sharded_data_parallel_adaptor.py"
+    )
     repo_root = Path(__file__).resolve().parents[3]
     if repo_root not in mindspeed_root.parents:
         raise RuntimeError(f"MindSpeed was imported outside this checkout: {mindspeed_root}")
@@ -210,12 +252,21 @@ def make_profile(args):
 def main():
     args = parse_args()
     from mindspeed.args_utils import get_mindspeed_args, set_full_args
+
     full_args = vars(get_mindspeed_args(get_defaults=True)).copy()
     full_args.update(vars(args))
     full_args["init_model_with_meta_device"] = False
     set_full_args(argparse.Namespace(**full_args))
     if args.extra_steps < 0:
         raise ValueError("--extra-steps must be nonnegative")
+    if args.hyper_offload_autotune and not args.hyper_offload:
+        raise ValueError("joint tuning requires --hyper-offload")
+    if (
+        args.hyper_offload_autotune
+        and args.offload_tuning_probe.endswith('_resident')
+        and args.offload_tuning_device_peak_mb is None
+    ):
+        raise ValueError('resident-region tuning requires an explicit whole-device peak limit')
     rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(rank)
     torch.set_num_threads(16)
@@ -224,7 +275,10 @@ def main():
     if dist.get_world_size() != 2:
         raise RuntimeError(f"expected exactly two NPU workers, got world size {dist.get_world_size()}")
     apply_hccl_premul_sum_patch()
-    log(rank, f"ENV torch={torch.__version__} torch_npu={torch_npu.__version__} visible={os.environ['ASCEND_RT_VISIBLE_DEVICES']}")
+    log(
+        rank,
+        f"ENV torch={torch.__version__} torch_npu={torch_npu.__version__} visible={os.environ['ASCEND_RT_VISIBLE_DEVICES']}",
+    )
     engine, vocab_size, parameter_count = make_engine(args, rank)
     engine.train()
     optimizer = torch.optim.SGD(engine.parameters(), lr=1.0e-2)
@@ -239,12 +293,55 @@ def main():
     session = None
     offload_stats = {"d2h_calls": 0, "d2h_gib": 0.0}
     if args.hyper_offload:
-        session = OffloadSession(OffloadConfig(
-            max_resident_activation_mb=args.offload_device_mb,
-            max_offload_activation_mb=args.offload_host_mb,
-            planner=(PeakResidencyPlanner(enable_communication_masking=args.offload_communication_masking)
-                     if args.offload_planner == "peak" else GreedyResidencyPlanner()),
-        ))
+        if args.hyper_offload_autotune:
+            from mindspeed.core.memory.hyper_offload.tuning import JointPolicy, JointTuningController, TuningLimits
+            from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
+            from mindspeed.core.memory.hyper_offload.tuning.session import JointOffloadSession
+
+            count = (
+                args.recompute_layers if args.recompute_layers is not None else (args.layers if args.recompute else 0)
+            )
+            controller = JointTuningController(
+                JointPolicy(
+                    0,
+                    args.offload_device_mb,
+                    args.offload_communication_masking,
+                    recompute_regions=tuple(str(i) for i in range(count)),
+                ),
+                QwenRegionNeighborhood(
+                    args.layers,
+                    count,
+                    probe=args.offload_tuning_probe,
+                    resident_mlp_fraction=args.offload_resident_mlp_fraction,
+                    window_probe_multiplier=args.offload_window_probe_multiplier,
+                    window_probe_limit_prefetch=not args.offload_window_probe_unlimited_prefetch,
+                ),
+                TuningLimits(
+                    max_steps=args.offload_tuning_steps,
+                    max_candidates=args.offload_tuning_candidates,
+                    device_peak_bytes=(
+                        None
+                        if args.offload_tuning_device_peak_mb is None
+                        else args.offload_tuning_device_peak_mb * 1024**2
+                    ),
+                    host_peak_bytes=args.offload_host_mb * 1024**2,
+                ),
+            )
+            session = JointOffloadSession(
+                controller, apply_policy=engine._hyper_offload_regions.apply_policy, host_mb=args.offload_host_mb
+            )
+        else:
+            session = OffloadSession(
+                OffloadConfig(
+                    max_resident_activation_mb=args.offload_device_mb,
+                    max_offload_activation_mb=args.offload_host_mb,
+                    planner=(
+                        PeakResidencyPlanner(enable_communication_masking=args.offload_communication_masking)
+                        if args.offload_planner == "peak"
+                        else GreedyResidencyPlanner()
+                    ),
+                )
+            )
         manager = session.residency_manager
         original_copy_d2h = manager.copy_d2h
 
@@ -266,8 +363,13 @@ def main():
         "fsdp_size": 2,
         "cpu_offload": False,
         "activation_swap": False,
-        "recompute": (args.recompute_layers if args.recompute_layers is not None else (args.layers if args.recompute else 0)) > 0,
-        "recompute_layers": args.recompute_layers if args.recompute_layers is not None else (args.layers if args.recompute else 0),
+        "recompute": (
+            args.recompute_layers if args.recompute_layers is not None else (args.layers if args.recompute else 0)
+        )
+        > 0,
+        "recompute_layers": args.recompute_layers
+        if args.recompute_layers is not None
+        else (args.layers if args.recompute else 0),
         "hyper_offload": args.hyper_offload,
         "offload_device_mb": args.offload_device_mb if args.hyper_offload else None,
         "offload_host_mb": args.offload_host_mb if args.hyper_offload else None,
@@ -290,6 +392,50 @@ def main():
         temporary_path.write_text(json.dumps(snapshot, indent=2))
         temporary_path.replace(result_path)
 
+    def observe_tuning(elapsed, peak_bytes):
+        if not args.hyper_offload_autotune or session.stable:
+            return
+        from dataclasses import asdict
+        from mindspeed.core.memory.hyper_offload.tuning import StepObservation
+        from mindspeed.core.memory.hyper_offload.tuning.consensus import policy_fingerprint
+
+        # Outside the measured interval; one consistent policy on every rank.
+        seconds = torch.tensor(elapsed, dtype=torch.float32, device='npu')
+        memory = torch.tensor(
+            [peak_bytes, session.residency_manager._host_pool.total_allocated],
+            dtype=torch.int64,
+            device='npu',
+        )
+        dist.all_reduce(seconds, op=dist.ReduceOp.MAX)
+        dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+        peak, host = memory.cpu().tolist()
+        session.observe(StepObservation(seconds.cpu().item(), peak, host))
+        policy = session.controller.policy
+        phases = ('warmup', 'measure', 'restore', 'confirm', 'stable')
+        decision = torch.tensor(
+            [session.controller.steps, phases.index(session.controller.phase), *policy_fingerprint(policy)],
+            dtype=torch.int64,
+            device='npu',
+        )
+        minimum, maximum = decision.clone(), decision.clone()
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        if not torch.equal(minimum, maximum):
+            raise RuntimeError('joint tuning decisions diverged across ranks; refusing a mismatched schedule')
+        result['joint_tuning'] = dict(
+            phase=session.controller.phase,
+            steps=session.controller.steps,
+            frozen_at_step=session.controller.frozen_at_step,
+            policy=asdict(session.controller.policy),
+            search_seconds=session.controller.search_seconds,
+            plan_seconds=session.plan_seconds,
+            plan_builds=session.plan_builds,
+            trace_collections=session.trace_collections,
+            post_offload_trim_calls=session.post_offload_trim_calls,
+            post_offload_trim_seconds=session.post_offload_trim_seconds,
+            trials=[asdict(trial) for trial in session.controller.trials],
+        )
+
     try:
         if profiler is not None:
             profiler.start()
@@ -310,16 +456,20 @@ def main():
         probe_local = probe_parameter.to_local() if isinstance(probe_parameter, DTensor) else probe_parameter
         update = float((probe_local.detach().reshape(-1)[:4096] - probe_before).abs().max())
         result.update(
-            status="one_step_complete", steps=1, loss=float(loss.item()),
-            probe_grad_max=grad_max, parameter_update_max=update,
+            status="one_step_complete",
+            steps=1,
+            loss=float(loss.item()),
+            probe_grad_max=grad_max,
+            parameter_update_max=update,
             first_step_elapsed_seconds=time.perf_counter() - started,
             first_step_npu_peak_allocated_gib=torch.npu.max_memory_allocated() / 2**30,
             first_step_npu_peak_reserved_gib=torch.npu.max_memory_reserved() / 2**30,
         )
         if session is not None and session.mode == "replay":
             schedule = session.executor._schedule
-            actions = [action for phase in (schedule.pre, schedule.post)
-                       for group in phase.values() for action in group]
+            actions = [
+                action for phase in (schedule.pre, schedule.post) for group in phase.values() for action in group
+            ]
             result["offload_plan_actions"] = {
                 kind: sum(action.kind.name == kind for action in actions)
                 for kind in ("COPY_D2H", "COPY_H2D", "RELEASE_DEVICE", "RELEASE_HOST")
@@ -327,6 +477,7 @@ def main():
         # Do not keep the custom ChunkLoss graph or its probe gradient alive
         # while later training steps allocate their working buffers.
         del loss, probe_grad, probe_grad_local
+        observe_tuning(result['first_step_elapsed_seconds'], torch.npu.max_memory_allocated())
         if args.extra_steps:
             result["extra_step_results"] = []
             result["status"] = "running"
@@ -359,7 +510,15 @@ def main():
                 "npu_peak_allocated_gib": torch.npu.max_memory_allocated() / 2**30,
                 "npu_peak_reserved_gib": torch.npu.max_memory_reserved() / 2**30,
                 "offload_mode": session.mode if session is not None else None,
+                "cache_trim_seconds": session.last_trim_seconds if session is not None else 0.0,
             }
+            if args.hyper_offload_autotune:
+                from dataclasses import asdict
+
+                step_result['joint_policy'] = asdict(session.executed_policy)
+                step_result['tuning_phase'] = session.controller.phase
+                step_result['post_offload_trim_calls'] = session.post_offload_trim_calls
+                step_result['post_offload_trim_seconds'] = session.post_offload_trim_seconds
             result["extra_step_results"].append(step_result)
             result["steps"] += 1
             log(rank, "EXTRA_STEP " + json.dumps(step_result))
@@ -369,6 +528,7 @@ def main():
             # Release the step output and probe references before the next
             # forward so they cannot pin allocations across iterations.
             del step_loss, step_grad, step_grad_local
+            observe_tuning(step_result['elapsed_seconds'], torch.npu.max_memory_allocated())
             write_progress()
         if args.extra_steps:
             result["status"] = "steps_complete"
