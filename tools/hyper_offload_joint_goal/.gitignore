@@ -1,0 +1,9 @@
+# Keep immutable run evidence locally without adding model-scale archives or
+# thousands of raw samples to Git. Source manifests and results are retained
+# in this directory and on the authorized test host.
+*
+!.gitignore
+!*.py
+!baseline/
+baseline/*
+!baseline/*.py
