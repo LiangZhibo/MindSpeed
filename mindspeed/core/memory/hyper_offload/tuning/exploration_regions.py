@@ -423,6 +423,18 @@ class ExplorationNeighborhood:
         points=sorted({len(paths)-1,(len(paths)-1)//2,0},reverse=True) if paths else []
         return [replace(paths[i],family='refine_regions') if i==0 and len(paths)>1 else paths[i] for i in points]
 
+    def _structural_beam(self, available):
+        """Keep the best measured policy for each distinct execution graph."""
+        beam, seen = [], set()
+        for trial, data in sorted(available, key=lambda item: item[0].score):
+            if trial.policy.structure_key in seen:
+                continue
+            beam.append((trial, data))
+            seen.add(trial.policy.structure_key)
+            if len(beam) >= self.beam_width:
+                break
+        return beam
+
     def __call__(self, trials):
         if not trials or not trials[0].feasible:
             return None
@@ -443,13 +455,7 @@ class ExplorationNeighborhood:
                     return self._record(Proposal(seed, trials[0].policy, 'legacy_seed', 0., ()))
         # Distinct structures preserve alternatives instead of allowing many
         # timing knobs on one graph to consume all beam positions.
-        beam, seen = [], set()
-        for trial, data in sorted(available, key=lambda x: x[0].score):
-            if trial.policy.structure_key in seen:
-                continue
-            beam.append((trial, data)); seen.add(trial.policy.structure_key)
-            if len(beam) >= self.beam_width:
-                break
+        beam = self._structural_beam(available)
         tested = {t.policy for t in trials}
         candidates = {}
         for trial, data in beam:

@@ -6,6 +6,7 @@ import pytest
 from mindspeed.core.memory.hyper_offload.ir.trace import ActivationTrace, TraceOp, StorageAccess, AccessKind as K
 from mindspeed.core.memory.hyper_offload.tuning.capacity_exploration import CapacityFirstNeighborhood
 from mindspeed.core.memory.hyper_offload.tuning.controller import JointPolicy, Trial
+from mindspeed.core.memory.hyper_offload.tuning.exploration_regions import Proposal
 from mindspeed.core.memory.hyper_offload.tuning.peak_windows import PeakWindowModel
 from mindspeed.core.memory.hyper_offload.tuning.trace_regions import RegionCost, SavedVersion
 from .test_exploration_regions import fixture as opaque_fixture, TARGET
@@ -154,6 +155,48 @@ def test_slow_widest_reference_survives_fastest_beam_pruning():
     assert search.diagnostics['proposals'][0]['family']=='global_budget_cut'
     assert len(search._references)==2
     assert search._budget_policies[result][0]==slow.policy.structure_key
+
+
+def test_timing_variants_do_not_displace_distinct_structures_from_refinement():
+    initial,data,costs=visible_fixture('renamed_network')
+    policy=replace(initial.policy,transfer_window_scale=1.)
+    trials=[Trial(replace(policy,trim_replay_interval=cycle),samples=[5.+cycle/10]*cycle)
+            for cycle in (1,2,3)]
+    trials.extend(Trial(replace(policy,recompute_regions=(cost.name,)),samples=[6.+i]*2)
+                  for i,cost in enumerate(costs[:3]))
+    search=CapacityFirstNeighborhood(lambda _:data)
+    search._capacity_seed_done=True
+    visited=[]
+    def record_parent(trial, _data):
+        visited.append(trial.policy)
+        return []
+    with patch(TARGET,return_value=costs),patch.object(search,'_reference',return_value=None), \
+            patch.object(search,'_refinements',side_effect=record_parent), \
+            patch.object(search,'_residency_refinements',return_value=[]):
+        assert search(trials) is None
+    assert visited==[trials[0].policy,trials[3].policy,trials[4].policy]
+
+
+def test_compression_refinement_visits_other_promising_structures_before_repeating_one():
+    initial,data,costs=visible_fixture('unknown_model')
+    data['codec_candidates']=('codec_a','codec_b')
+    less_offload=replace(initial.policy,recompute_regions=tuple(c.name for c in costs[:2]),
+                         transfer_window_scale=1.)
+    more_offload=replace(less_offload,recompute_regions=(costs[0].name,))
+    measured_codec=replace(less_offload,codec_key='codec_a')
+    trials=[Trial(less_offload,samples=[5.,5.]),Trial(more_offload,samples=[5.2,5.2]),
+            Trial(measured_codec,samples=[4.9,4.9])]
+    search=CapacityFirstNeighborhood(lambda _:data)
+    search._capacity_seed_done=True
+    search._record(Proposal(measured_codec,less_offload,'compression',0.,()))
+    # The next family-balanced opportunity is compression. One structure
+    # has already received a codec trial; the other must get an opportunity
+    # before another codec is tried on the same fastest structure.
+    search._family_counts.update(trim=2,schedule=2,residency=2)
+    with patch(TARGET,return_value=costs),patch.object(search,'_reference',return_value=None), \
+            patch.object(search,'_residency_refinements',return_value=[]):
+        proposed=search(trials)
+    assert proposed==replace(more_offload,codec_key='codec_a')
 
 
 def test_budget_refinement_brackets_both_sides_and_retires_graph_state():

@@ -471,7 +471,7 @@ class CapacityFirstNeighborhood(ExplorationNeighborhood):
                     self._reopened_structures.add(key)
                     return self._record(proposal)
         refinements = []
-        for trial,data in sorted(available,key=lambda item:item[0].score)[:self.beam_width]:
+        for trial,data in self._structural_beam(available):
             refinements.extend(p for p in self._refinements(trial,data) if p.policy not in tested)
             if trial.policy not in self._fronts:
                 self._fronts[trial.policy] = self._residency_refinements(trial,data)
@@ -488,8 +488,18 @@ class CapacityFirstNeighborhood(ExplorationNeighborhood):
             return result
         if refinements:
             order = ('compression','trim','schedule','residency')
+            # A fast graph's timing/codec variants must not consume every
+            # refinement opportunity. Preserve the global family balance,
+            # then visit other promising structures before repeating the
+            # same family on one graph. Only executed proposals count.
+            visits = {}
+            for prior in self._metadata.values():
+                if prior.policy in tested:
+                    key = (prior.family,prior.parent.structure_key)
+                    visits[key] = visits.get(key,0)+1
             chosen = min(refinements,key=lambda p:(self._family_counts.get(p.family,0),
-                order.index(p.family),self._axis_counts.get(p.refinement_axis,0),
+                order.index(p.family),visits.get((p.family,p.parent.structure_key),0),
+                self._axis_counts.get(p.refinement_axis,0),
                 next(t.score for t in trials if t.policy==p.parent)))
             # An allocated but deferred structural point is not a tested point.
             if structural is not None:
