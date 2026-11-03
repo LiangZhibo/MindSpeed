@@ -140,6 +140,14 @@ def main() -> None:
             module.forward = skip_offload(module.forward)
         print(f"[glm53] HyperOffload opaque hyperconnections={','.join(name for name, _ in hc_modules)}", flush=True)
 
+        attention_modules = [(name, module) for name, module in modules.items()
+                             if name.endswith(".self_attn") and ".language_model.layers." in name]
+        if not attention_modules:
+            raise RuntimeError("HyperOffload found no GLM attention modules")
+        for _, module in attention_modules:
+            module.forward = skip_offload(module.forward)
+        print(f"[glm53] HyperOffload opaque attention={','.join(name for name, _ in attention_modules)}", flush=True)
+
     @wraps(original_step)
     def instrumented_step(engine, train_dataloader_iter):
         torch.npu.reset_peak_memory_stats()

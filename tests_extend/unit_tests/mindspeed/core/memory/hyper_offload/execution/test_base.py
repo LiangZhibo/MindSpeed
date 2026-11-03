@@ -21,7 +21,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from mindspeed.core.memory.hyper_offload.execution.base import BaseExecutor
+from mindspeed.core.memory.hyper_offload.execution.base import BaseExecutor, OpaqueRegionEnd
+from mindspeed.core.memory.hyper_offload.execution.tensor import ShadowTensor
 from mindspeed.core.memory.hyper_offload.runtime.residency import PhysicalBuffer, ResidencyManager
 
 
@@ -65,6 +66,23 @@ class TestBaseExecutor(unittest.TestCase):
         self.assertEqual(self.executor.op_idx, -1)
         self.assertEqual(self.executor._opaque_depth, 0)  # pylint: disable=protected-access
         self.assertFalse(self.executor.in_opaque_region)
+
+    def test_opaque_backward_resolves_incoming_shadow_gradient(self) -> None:
+        source = torch.tensor([2.0, 3.0])
+        buffer = PhysicalBuffer(device=source.device)
+        storage = source.untyped_storage()
+        buffer.device_buffer = torch.empty(0, dtype=torch.uint8)
+        buffer.device_buffer.set_(storage, 0, (storage.size(),), (1,))
+        shadow = ShadowTensor(source, buffer, storage_id=7)
+        self.executor._session_active = True  # pylint: disable=protected-access
+        ctx = MagicMock(executor=self.executor, func_name="custom", generation=self.executor._generation,
+                        backward_inputs=())  # pylint: disable=protected-access
+
+        native = OpaqueRegionEnd.backward(ctx, shadow)[-1]
+
+        self.assertFalse(isinstance(native, ShadowTensor))
+        torch.testing.assert_close(native, source)
+        self.assertTrue(self.executor.in_opaque_region)
 
     def test_on_op_begin_increments_op_idx(self) -> None:
         self.executor.on_op_begin(MagicMock(), (), {})

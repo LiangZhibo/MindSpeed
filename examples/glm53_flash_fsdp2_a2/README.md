@@ -73,7 +73,7 @@ The first iteration includes tracing/planning and is excluded from the steady-ti
 
 The HyperOffload runner disables dispatch modes around `get_batch` within the session. `TrainEngine` creates the DataLoader iterator lazily, so fetching a batch with `TorchDispatchMode` active can fork workers that inherit the dispatch context. Those workers may spin in CPU preprocessing without returning a batch or launching NPU work. Keep data loading outside the activation tracking scope.
 
-The runner also marks each GLM hyperconnection as an opaque HyperOffload region. Its Sinkhorn implementation calls Triton kernels with raw pointers, so wrapping its internal allocations in `ShadowTensor` is invalid. This retains the original hyperconnection computation while allowing the surrounding activations to be tracked.
+The runner also marks GLM hyperconnections and language attention modules as opaque HyperOffload regions. Sinkhorn and the KDA causal convolution call Triton kernels with raw pointers, so wrapping their internal allocations in `ShadowTensor` is invalid. This retains the original computation while allowing surrounding activations to be tracked; the contents of these regions cannot themselves be offloaded.
 
 ## Logs and evidence
 

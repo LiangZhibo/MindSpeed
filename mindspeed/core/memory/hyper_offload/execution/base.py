@@ -118,7 +118,13 @@ class OpaqueRegionEnd(torch.autograd.Function):
         executor.on_op_begin(bwd_dummy, inputs, {})
 
         executor.enter_opaque_region()
-        return (None, None, None, torch.zeros(1)) + grad_outputs
+        # Custom kernels inside an opaque backward may use data pointers
+        # directly, bypassing tensor dispatch. Resolve incoming gradients while
+        # the boundary protects them from eviction, before calling that code.
+        with torch.utils._python_dispatch._disable_current_modes(), torch._C._DisableTorchDispatch():
+            native_grads = tuple(value.resolve() if isinstance(value, ShadowTensor) else value
+                                 for value in grad_outputs)
+        return (None, None, None, torch.zeros(1)) + native_grads
 
 
 class BaseExecutor(ABC):
