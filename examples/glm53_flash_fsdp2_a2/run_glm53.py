@@ -2,9 +2,9 @@
 """Run MindSpeed-MM GLM-5.3-Flash with optional HyperOffload instrumentation."""
 
 import argparse
+import importlib
 from functools import wraps
 import json
-import os
 import runpy
 import sys
 import time
@@ -128,33 +128,21 @@ def main() -> None:
         engine._glm53_skip_regions_ready = True
         print(f"[glm53] HyperOffload opaque recompute modules={','.join(unique)}", flush=True)
 
-        # Sinkhorn uses Triton kernels with raw tensor pointers. Keep its
-        # enclosing hyperconnection opaque so internal allocations stay native
-        # tensors; tracing empty() outputs as ShadowTensor gives invalid pointers.
-        from mindspeed_mm.fsdp.models.glm5_next.modeling_glm5_next import Glm5NextTextHyperConnection
-
-        hc_modules = [(name, module) for name, module in modules.items()
-                      if isinstance(module, Glm5NextTextHyperConnection)]
-        if not hc_modules:
-            raise RuntimeError("HyperOffload found no GLM hyperconnection modules")
-        for _, module in hc_modules:
-            module.forward = skip_offload(module.forward)
-        print(f"[glm53] HyperOffload opaque hyperconnections={','.join(name for name, _ in hc_modules)}", flush=True)
-
-        disabled_layers = {
-            int(item) for item in os.environ.get("GLM53_DISABLE_RECOMPUTE_LAYERS", "").split(",")
-            if item.strip()
-        }
-        attention_modules = [
-            (name, module) for name, module in modules.items()
-            if name.endswith(".self_attn") and ".language_model.layers." in name
-            and int(name.split(".language_model.layers.", 1)[1].split(".", 1)[0]) in disabled_layers
-        ]
-        if not attention_modules:
-            raise RuntimeError("HyperOffload found no GLM attention modules")
-        for _, module in attention_modules:
-            module.forward = skip_offload(module.forward)
-        print(f"[glm53] HyperOffload opaque attention={','.join(name for name, _ in attention_modules)}", flush=True)
+        # These custom autograd functions launch Triton kernels that consume
+        # native storage pointers. Isolate just those calls so adjacent eager
+        # activations remain eligible for offload.
+        modeling = importlib.import_module(
+            "mindspeed_mm.fsdp.models.glm5_next.modeling_glm5_next"
+        )
+        for function_name in ("hc_split_sinkhorn", "causal_conv1d"):
+            function = getattr(modeling, function_name, None)
+            if function is None:
+                raise RuntimeError(f"HyperOffload cannot find GLM kernel function {function_name}")
+            if not getattr(function, "_glm53_skip_offload", False):
+                wrapped_function = skip_offload(function, track_backward_inputs=True)
+                wrapped_function._glm53_skip_offload = True
+                setattr(modeling, function_name, wrapped_function)
+        print("[glm53] HyperOffload opaque custom kernels=hc_split_sinkhorn,causal_conv1d", flush=True)
 
     @wraps(original_step)
     def instrumented_step(engine, train_dataloader_iter):
