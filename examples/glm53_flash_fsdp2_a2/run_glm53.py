@@ -142,9 +142,21 @@ def main() -> None:
                 wrapped_function = skip_offload(function, track_backward_inputs=True)
                 wrapped_function._glm53_skip_offload = True
                 setattr(modeling, function_name, wrapped_function)
+        sparse_attention_modules = [
+            module for module in modules.values()
+            if getattr(module, "_sparse_flash_attention", None) is not None
+        ]
+        if not sparse_attention_modules:
+            raise RuntimeError("HyperOffload found no GLM sparse flash attention modules")
+        for module in sparse_attention_modules:
+            function = module._sparse_flash_attention
+            if not getattr(function, "_glm53_skip_offload", False):
+                module._sparse_flash_attention = skip_offload(function, track_backward_inputs=True)
+                module._sparse_flash_attention._glm53_skip_offload = True
         print(
             "[glm53] HyperOffload opaque custom kernels="
-            "hc_split_sinkhorn,causal_conv1d,chunk_kda_ascendc",
+            "hc_split_sinkhorn,causal_conv1d,chunk_kda_ascendc,sparse_flash_attention "
+            f"(modules={len(sparse_attention_modules)})",
             flush=True,
         )
 
