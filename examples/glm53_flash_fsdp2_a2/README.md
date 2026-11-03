@@ -71,6 +71,8 @@ The fixed initial HyperOffload policy uses the peak planner, 2048 MiB resident a
 
 The first iteration includes tracing/planning and is excluded from the steady-time mean. Compare iterations 2–10 on the same pair, runtime, model, seed, allocator (`expandable_segments:True`), dataset, and optimizer. Include all iterations in peak-memory reporting. HyperOffload is an experimental GLM/FSDP integration; claim a performance result only if both ranks finish ten steps and record replay-phase transfers.
 
+The HyperOffload runner fetches and moves each batch before entering its dispatch session. `TrainEngine` creates the DataLoader iterator lazily, so fetching a batch inside the active `TorchDispatchMode` can fork DataLoader workers that inherit the dispatch context. Those workers may spin in CPU preprocessing without returning a batch or launching NPU work. `run_glm53.py` explicitly disables active dispatch modes around `get_batch`; keep data loading outside the activation tracking scope.
+
 ## Logs and evidence
 
 Keep runs in their unique experiment directories. The launcher refuses an existing run directory, so metrics and train.log cannot append to an earlier run. Before a new test series, archive and clear `glm53-env/logs/`. Historical loose GLM logs are now compressed in `glm53-env/log_archives/20261103_164915/legacy_glm_logs.tar.gz`, with a per-file SHA256 manifest. The current logs directory is empty. To read a historical file without restoring it, use `tar -xOf ARCHIVE glm53-env/logs/FILENAME`. Do not remove the accepted baseline or OOM run directories, their metrics/configuration/logs, Qwen measurements, or Qwen OOM evidence.
