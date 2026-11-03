@@ -382,6 +382,23 @@ class JointTuningController:
             return
         self.stop_reason = self.stop_reason or ('proposal_exhausted' if can_search else 'tuning_budget')
         self.confirmation_reference_index = prior_best_index if self._cycle_steps(best.policy) > 1 else 0
+        strict_best_index = best_index
+        tentative = self.trials[-1]
+        tentative_confirmation = (
+            self.limits.validate_confirmation_timing
+            and tentative is not best
+            and tentative.policy == self.policy
+            and tentative.score < best.score
+            and self._cycle_steps(best.policy) == 1
+            and self.steps + self._confirmation_steps(tentative.policy) + 1 <= self.limits.max_steps
+        )
+        if tentative_confirmation:
+            # Spend the remaining complete confirmation window on the current
+            # lower-score challenger before paying to restore the incumbent.
+            # The same gain/noise margin still gates acceptance, and a full
+            # validation step is reserved for the measured fallback policy.
+            self.confirmation_reference_index = best_index
+            best = tentative
         restoring = self.policy != best.policy
         self.phase = 'restore' if restoring else 'confirm'
         self.policy = best.policy
@@ -403,4 +420,6 @@ class JointTuningController:
             spreads=[t.spread if math.isfinite(t.spread) else None for t in self.trials],
             confirmation_target=self.confirmation_target,
             confirmation_cycle_steps=self._cycle_steps(best.policy),
-            confirmation_reference_index=self.confirmation_reference_index))
+            confirmation_reference_index=self.confirmation_reference_index,
+            strict_best_index=strict_best_index,
+            tentative_confirmation=tentative_confirmation))

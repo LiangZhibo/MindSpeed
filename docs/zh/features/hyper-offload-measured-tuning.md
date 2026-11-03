@@ -29,6 +29,8 @@ session = MeasuredOffloadSession(
 
 `transfer_size_calibration=True` 仅在有限 warmup 内按实际流量选择探针，并受可用内存约束；默认关闭。`joint_refinement=True` 可在第二个候选中同时细化区域和清理周期，默认关闭。周期候选必须测量和确认完整周期，预算不足则不继续尝试。
 
+若当前候选的完整周期分数更低，但短样本尚未越过噪声门槛，控制器可用剩余预算执行一次独立完整确认，再决定是否接受。该路径要求回退对象为已测量的非周期策略，并预留一个完整回退验证步；确认仍使用相同的收益与噪声门槛。未通过确认就恢复先前策略，最多12步冻结，不追加候选，也不按模型名称调整门槛。`selection_log` 记录原先胜者与待确认候选，避免把待确认误报为已接受。
+
 Qwen 示例的 `--offload-tuning-method measured` 是默认调优入口，结构布局默认 `gated`。使用时显式提供 `--offload-tuning-device-peak-mb` 和激活/Host 预算；可选 `--offload-transfer-size-calibration`、`--offload-joint-refinement`。`parallel_mlp` 用于经认证的并行残差结构，不能仅凭模型名称选取。
 
 历史 Qwen 手工候选已移到同示例目录的 `legacy_tuning.py`，只有显式 `--offload-tuning-method legacy` 才使用。旧的 `mindspeed...tuning.proposals.QwenRegionNeighborhood` 导入路径不再提供；通用包仅保留通用候选逻辑。固定层数扫描和本机部署脚本独立保存为实验材料，不是生产算法默认规则。

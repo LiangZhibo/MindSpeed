@@ -342,3 +342,51 @@ def test_periodic_confirmation_drift_returns_previous_winner():
     assert tuner.phase=='fallback' and tuner.policy==cut
     observe_costs(tuner,[10])
     assert tuner.stable and tuner.policy==cut and tuner.frozen_at_step==12
+
+
+def tentative_periodic_case(validate=True):
+    policies = [JointPolicy(0, 8, recompute_regions=(name,), trim_replay_interval=cycle)
+                for name, cycle in [('encoder', 1), ('projection', 1), ('activation', 2)]]
+    tuner = JointTuningController(policies[0], lambda trials: policies[len(trials)],
+        TuningLimits(max_steps=12, timing_noise_multiplier=1,
+                     validate_confirmation_timing=validate))
+    observe_costs(tuner, [99, 9.9, 10.1, 99, 8.9, 9.1, 99, 8.92, 8.98])
+    return tuner, policies
+
+
+def test_lower_score_near_tie_can_use_remaining_complete_confirmation_cycle():
+    tuner, policies = tentative_periodic_case()
+    assert tuner.phase == 'confirm' and tuner.policy == policies[2]
+    assert tuner.confirmation_reference_index == 1 and tuner.confirmation_target == 2
+    selection = tuner.selection_log[-1]
+    assert selection['tentative_confirmation'] and selection['strict_best_index'] == 1
+    assert selection['selected_index'] == 2
+    observe_costs(tuner, [8.7])
+    assert not tuner.stable  # Never accept a partial execution cycle.
+    observe_costs(tuner, [8.8])
+    assert tuner.stable and tuner.policy == policies[2] and tuner.frozen_at_step == 11
+    counters = tuner.steps, tuner.search_seconds, len(tuner.selection_log)
+    observe_costs(tuner, [100] * 20)
+    assert counters == (tuner.steps, tuner.search_seconds, len(tuner.selection_log))
+
+
+def test_tentative_confirmation_preserves_margin_and_prior_incumbent_fallback():
+    for costs in ([8.9, 8.9], [9.1, 9.2]):
+        tuner, policies = tentative_periodic_case()
+        observe_costs(tuner, costs)
+        # Even a confirmation mean below 9 must clear the unchanged margin.
+        assert tuner.phase == 'fallback' and tuner.policy == policies[1]
+        observe_costs(tuner, [9])
+        assert tuner.stable and tuner.frozen_at_step == 12
+        assert tuner.confirmation_fallback and tuner.policy == policies[1]
+
+
+def test_tentative_confirmation_requires_validation_mode_and_valid_capacity():
+    import pytest
+    tuner, policies = tentative_periodic_case(validate=False)
+    assert tuner.phase == 'restore' and tuner.policy == policies[1]
+    assert not tuner.selection_log[-1]['tentative_confirmation']
+    tuner, _ = tentative_periodic_case()
+    with pytest.raises(RuntimeError, match='failed confirmation'):
+        tuner.observe(StepObservation(8, 100, 200, False))
+    assert not tuner.stable
