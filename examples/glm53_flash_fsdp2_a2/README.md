@@ -71,7 +71,9 @@ The fixed initial HyperOffload policy uses the peak planner, 2048 MiB resident a
 
 The first iteration includes tracing/planning and is excluded from the steady-time mean. Compare iterations 2–10 on the same pair, runtime, model, seed, allocator (`expandable_segments:True`), dataset, and optimizer. Include all iterations in peak-memory reporting. HyperOffload is an experimental GLM/FSDP integration; claim a performance result only if both ranks finish ten steps and record replay-phase transfers.
 
-The HyperOffload runner fetches and moves each batch before entering its dispatch session. `TrainEngine` creates the DataLoader iterator lazily, so fetching a batch inside the active `TorchDispatchMode` can fork DataLoader workers that inherit the dispatch context. Those workers may spin in CPU preprocessing without returning a batch or launching NPU work. `run_glm53.py` explicitly disables active dispatch modes around `get_batch`; keep data loading outside the activation tracking scope.
+The HyperOffload runner disables dispatch modes around `get_batch` within the session. `TrainEngine` creates the DataLoader iterator lazily, so fetching a batch with `TorchDispatchMode` active can fork workers that inherit the dispatch context. Those workers may spin in CPU preprocessing without returning a batch or launching NPU work. Keep data loading outside the activation tracking scope.
+
+The runner also marks each GLM hyperconnection as an opaque HyperOffload region. Its Sinkhorn implementation calls Triton kernels with raw pointers, so wrapping its internal allocations in `ShadowTensor` is invalid. This retains the original hyperconnection computation while allowing the surrounding activations to be tracked.
 
 ## Logs and evidence
 

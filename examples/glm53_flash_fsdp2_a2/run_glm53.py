@@ -127,6 +127,19 @@ def main() -> None:
         engine._glm53_skip_regions_ready = True
         print(f"[glm53] HyperOffload opaque recompute modules={','.join(unique)}", flush=True)
 
+        # Sinkhorn uses Triton kernels with raw tensor pointers. Keep its
+        # enclosing hyperconnection opaque so internal allocations stay native
+        # tensors; tracing empty() outputs as ShadowTensor gives invalid pointers.
+        from mindspeed_mm.fsdp.models.glm5_next.modeling_glm5_next import Glm5NextTextHyperConnection
+
+        hc_modules = [(name, module) for name, module in modules.items()
+                      if isinstance(module, Glm5NextTextHyperConnection)]
+        if not hc_modules:
+            raise RuntimeError("HyperOffload found no GLM hyperconnection modules")
+        for _, module in hc_modules:
+            module.forward = skip_offload(module.forward)
+        print(f"[glm53] HyperOffload opaque hyperconnections={','.join(name for name, _ in hc_modules)}", flush=True)
+
     @wraps(original_step)
     def instrumented_step(engine, train_dataloader_iter):
         torch.npu.reset_peak_memory_stats()
