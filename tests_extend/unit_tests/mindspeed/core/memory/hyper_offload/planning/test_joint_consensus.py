@@ -33,3 +33,39 @@ def test_consensus_uses_canonical_region_order_and_covers_none_window():
     second = JointPolicy(0, 64, recompute_regions=('0.mlp', '1.mlp'))
     assert policy_fingerprint(first) == policy_fingerprint(second)
     assert policy_fingerprint(first) != policy_fingerprint(replace(first, transfer_window_scale=0.0))
+
+
+def test_full_decision_encodes_real_confirmation_fallback_and_frozen_state():
+    from mindspeed.core.memory.hyper_offload.tuning.controller import JointTuningController, StepObservation, TuningLimits
+    from mindspeed.core.memory.hyper_offload.tuning.consensus import decision_fingerprint
+    first,second=JointPolicy(2,8),JointPolicy(1,8)
+    tuner=JointTuningController(first,lambda trials:second if len(trials)==1 else None,
+        TuningLimits(max_steps=10,timing_noise_multiplier=1,validate_confirmation_timing=True))
+    states={}
+    for value in (99,10,10,99,8,8,11,11,10):
+        states[tuner.phase]=decision_fingerprint(tuner)
+        tuner.observe(StepObservation(value,100,200))
+    states[tuner.phase]=decision_fingerprint(tuner)
+    assert 'fallback' in states and 'stable' in states
+    assert states['fallback'][2:6]==states['stable'][2:6]==policy_fingerprint(first)
+    assert states['fallback']!=states['stable'] and tuner.frozen_at_step==9
+    frozen=decision_fingerprint(tuner)
+    tuner.observe(StepObservation(1000,100,200))
+    assert decision_fingerprint(tuner)==frozen
+    import pytest
+    tuner.phase='unsupported'
+    with pytest.raises(ValueError):decision_fingerprint(tuner)
+
+
+def test_confirmation_reference_and_cycle_target_are_in_consensus():
+    from mindspeed.core.memory.hyper_offload.tuning.controller import JointTuningController,Trial
+    from mindspeed.core.memory.hyper_offload.tuning.consensus import decision_fingerprint
+    from dataclasses import replace
+    initial=JointPolicy(3,8)
+    tuner=JointTuningController(initial,lambda _:None)
+    tuner.trials=[Trial(initial,samples=[12,12]),Trial(replace(initial,recompute_count=2),samples=[10,10])]
+    first=decision_fingerprint(tuner)
+    tuner.confirmation_reference_index=1
+    second=decision_fingerprint(tuner)
+    tuner.confirmation_target+=1
+    assert len({first,second,decision_fingerprint(tuner)})==3

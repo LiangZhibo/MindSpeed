@@ -46,6 +46,10 @@ def signature(value, scalar_values=True):
             except (RuntimeError, NotImplementedError):
                 key = ("tensor", id(physical))
                 storage_bytes = None
+        if isinstance(leaf, ShadowTensor) and leaf._buffer.logical_nbytes:
+            # A Host snapshot may be an encoded packet. Replay contracts describe
+            # the original logical storage, independent of physical residency.
+            storage_bytes = leaf._buffer.logical_nbytes
         alias = aliases.setdefault(key, len(aliases))
         strided = leaf.layout == torch.strided
         metadata.append((

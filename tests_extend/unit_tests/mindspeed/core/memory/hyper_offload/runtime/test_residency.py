@@ -37,16 +37,16 @@ from mindspeed.core.memory.hyper_offload.execution.tensor import ShadowTensor
 # ---------------------------------------------------------------------------
 
 
-def _mock_accelerator_if_needed() -> Any:
+def _mock_accelerator_if_needed(*, force=False) -> Any:
     """Return a ``patch`` context that mocks accelerator APIs for CPU.
 
     When CUDA is not available, this patches ``torch.accelerator``,
     ``torch.Stream``, ``torch.Event``, and ``pin_memory`` so that the
     offload runtime can function on CPU-only hosts.
     """
-    if torch.cuda.is_available() or (
+    if not force and (torch.cuda.is_available() or (
         hasattr(torch, "npu") and torch.npu.is_available()
-    ):
+    )):
         return _NullPatchContext()
 
     patchers = []
@@ -71,6 +71,9 @@ def _mock_accelerator_if_needed() -> Any:
     patchers.append(
         patch.multiple(
             "torch.accelerator",
+            # PyTorch 2.7 has accelerator but keeps memory helpers elsewhere.
+            # These are test-only CPU stubs, restored when the context exits.
+            create=True,
             is_available=lambda: True,
             current_accelerator=_current_accelerator,
             current_stream=_current_stream,

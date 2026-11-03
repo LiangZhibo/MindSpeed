@@ -179,6 +179,7 @@ class MaskingContext:
     h2d_bandwidth_gbps: float = 16.0
     transfer_window_scale: float | None = None
     limit_prefetch_window: bool = True
+    transfer_cost_samples: tuple[tuple[int, float, float], ...] = ()
 
 
 @dataclass(frozen=True)

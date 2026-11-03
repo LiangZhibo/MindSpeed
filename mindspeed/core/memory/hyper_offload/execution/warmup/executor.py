@@ -26,6 +26,8 @@ Physical state transitions are delegated to
 from __future__ import annotations
 
 import logging
+import math
+from statistics import median
 from typing import Any
 
 import torch
@@ -64,9 +66,12 @@ class WarmupExecutor(BaseExecutor):
         self,
         residency_manager: ResidencyManager,
         memory_limit_bytes: int,
+        *, transfer_probe_budget=None,
     ) -> None:
         super().__init__(residency_manager)
         self._memory_limit_bytes = memory_limit_bytes
+        self._transfer_probe_budget = transfer_probe_budget
+        self._transfer_size_counts = {}
         self._tracker = ActivationTracker()
         self._timer = DeviceTimer()
         self._guide: list[OpGuide] = []
@@ -105,6 +110,11 @@ class WarmupExecutor(BaseExecutor):
                     f"protected_sids={protected_sids}"
                 )
 
+            if self._transfer_probe_budget is not None:
+                buffer = self.residency_manager._residency[victim_sid]
+                if buffer.host_buffer is None and buffer.device_buffer is not None:
+                    size = buffer.device_buffer.numel()
+                    self._transfer_size_counts[size] = self._transfer_size_counts.get(size,0)+1
             self.residency_manager.copy_d2h(victim_sid)
             self.residency_manager.release_device(victim_sid)
 
@@ -115,6 +125,10 @@ class WarmupExecutor(BaseExecutor):
     def on_op_begin(self, func, args, kwargs) -> None:
         """Before op: enforce memory budget and fault inputs back to device."""
         super().on_op_begin(func, args, kwargs)
+        # Warmup can evict at this boundary before its plan is known.
+        set_node = getattr(self.residency_manager, "set_transfer_node", None)
+        if set_node is not None:
+            set_node(self.op_idx, "pre", op_identity(func))
 
         protected_sids: set[int] = set()
         for t in iter_tensors((args, kwargs)):
@@ -193,7 +207,34 @@ class WarmupExecutor(BaseExecutor):
 
     def finish(self) -> tuple[ActivationTrace, list[OpGuide]]:
         """Finish warmup and return recorded trace and replay guide."""
-        d2h, h2d = profile_transfer_bandwidth()
+        points = []
+        if self._transfer_probe_budget is None:
+            d2h, h2d = profile_transfer_bandwidth()
+        else:
+            details = {}
+            if self._transfer_probe_budget()>=16*1024**2:
+                d2h, h2d = profile_transfer_bandwidth(diagnostics=details)
+            else:
+                d2h, h2d = 1.0, 1.0
+            def retain(info):
+                outbound, inbound = info.get('d2h_samples_ms',()), info.get('h2d_samples_ms',())
+                if (info.get('status')=='measured' and outbound and inbound
+                        and all(math.isfinite(x) and x>0 for x in (*outbound,*inbound))):
+                    points.append((info['bytes'],median(outbound),median(inbound)))
+            retain(details)
+            # Three dominant actual D2H payload sizes, ranked by transferred
+            # bytes. The legacy probe remains a fourth anchor when valid.
+            ranked = sorted(self._transfer_size_counts,key=lambda n:(-n*self._transfer_size_counts[n],n))
+            attempted = 0
+            for size in ranked:
+                if size==16*1024**2 or size<=0 or size>self._transfer_probe_budget():
+                    continue
+                if attempted>=3:break
+                attempted += 1
+                info = {}
+                profile_transfer_bandwidth(size_bytes=size,diagnostics=info)
+                retain(info)
+            points.sort()
 
         trace = ActivationTrace(
             ops=list(self._ops),
@@ -202,6 +243,7 @@ class WarmupExecutor(BaseExecutor):
             memory_limit_bytes=self._memory_limit_bytes,
             d2h_bandwidth_gbps=d2h,
             h2d_bandwidth_gbps=h2d,
+            transfer_cost_samples=tuple(points),
         )
         guide = self._guide
 
@@ -211,6 +253,7 @@ class WarmupExecutor(BaseExecutor):
     def reset(self) -> None:
         """Reset."""
         self._sid_produced_at_op.clear()
+        self._transfer_size_counts.clear()
         self._ops = []
         self._guide = []
         self._tracker.clear_activations()

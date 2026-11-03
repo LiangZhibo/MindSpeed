@@ -49,6 +49,8 @@ class NamedRecomputeRegions:
         self._conflicts = set()
         self.selected = frozenset()
         self.resident = frozenset()
+        self.observer = None
+        self.offloaded_checkpoint_inputs = set()
 
     @property
     def names(self):
@@ -85,11 +87,23 @@ class NamedRecomputeRegions:
         checkpointed = recompute if offload_checkpoint_inputs else skip_offload(recompute)
         resident = skip_offload(function)
         self._callables[name] = function
+        if offload_checkpoint_inputs:
+            self.offloaded_checkpoint_inputs.add(name)
 
         @wraps(function)
         def call(*args, **kwargs):
             target = checkpointed if name in self.selected else resident if name in self.resident else function
-            return target(*args, **kwargs)
+            observer = self.observer
+            if observer is None:
+                return target(*args, **kwargs)
+            token = observer.begin(name, (args, kwargs))
+            try:
+                result = target(*args, **kwargs)
+            except BaseException:
+                observer.abort(token)
+                raise
+            observer.end(token, result)
+            return result
 
         return call
 
@@ -154,8 +168,8 @@ class NamedRecomputeRegions:
         self.resident = resident
 
 
-def qwen_recompute_regions(layers):
-    """Expose Qwen modules, projection-plus-SiLU and SiLU-plus-product groups.
+def gated_decoder_recompute_regions(layers, *, canonical_pointwise=False):
+    """Adapter for certified gate/up/down decoder blocks and pointwise groups.
 
     With pointwise selected, both independent projections precede the SiLU and
     product checkpoint. Otherwise the original evaluation order is retained.
@@ -181,11 +195,37 @@ def qwen_recompute_regions(layers):
         regions.register_conflict(prefix + '.mlp.gate', pointwise_name)
 
         def mlp_forward(x, module=mlp, gate_region=gate_call, pointwise_region=pointwise_call, name=pointwise_name):
-            if name in regions.selected or name in regions.resident:
+            if canonical_pointwise or name in regions.selected or name in regions.resident:
                 return module.down_proj(pointwise_region(module.gate_proj(x), module.up_proj(x)))
             return module.down_proj(gate_region(x) * module.up_proj(x))
 
         mlp.forward = mlp_forward
+    return regions
+
+
+def qwen_recompute_regions(layers):
+    """Compatibility adapter retaining the historical Qwen evaluation order."""
+    return gated_decoder_recompute_regions(layers)
+
+
+def decoder_recompute_regions(layers, *, layout):
+    """Expose certified architecture boundaries; selection remains generic.
+
+    ``gated`` certifies independent gate/up projections with no intervening
+    stateful operations, allowing the pointwise group to be observed in raw
+    warmup. ``parallel_mlp`` preserves the original decoder/MLP forward and
+    exposes its activation module, including GELU. Callers, not an inferred
+    name match, choose the supported structural contract.
+    """
+    if layout == 'gated':
+        return gated_decoder_recompute_regions(layers, canonical_pointwise=True)
+    if layout != 'parallel_mlp':
+        raise ValueError('unsupported certified decoder region layout')
+    regions = NamedRecomputeRegions(layers)
+    for index, layer in enumerate(layers):
+        prefix = str(index)
+        for suffix in ('', '.attention', '.mlp', '.mlp.act', '.input_layernorm', '.post_attention_layernorm'):
+            regions.register_module(prefix + suffix)
     return regions
 
 

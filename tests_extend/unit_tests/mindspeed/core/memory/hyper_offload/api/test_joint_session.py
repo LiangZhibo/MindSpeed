@@ -53,6 +53,7 @@ class Model(torch.nn.Module):
     (JointPolicy(3, 64, prefetch_on_copy_stream=True), 3, 1),
     (JointPolicy(3, 64, trim_before_replay=False), 3, 1),
     (JointPolicy(3, 64, trim_after_offload=True), 3, 1),
+    (JointPolicy(3, 64, trim_replay_interval=2), 3, 1),
 ])
 def test_joint_switches_preserve_rng_gradients_and_updates(candidate, best_count, collections):
     torch.manual_seed(2)
@@ -230,7 +231,6 @@ def test_pointwise_region_rejects_overlap_across_recompute_and_resident_before_s
 
 
 def test_placement_switch_and_cached_return_preserve_full_model_updates():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     torch.manual_seed(37)
     reference = Model()
     reference.layers = torch.nn.ModuleList([FineBlock() for _ in range(4)])
@@ -276,3 +276,147 @@ def test_placement_switch_and_cached_return_preserve_full_model_updates():
         assert session.policy_switches == 3 and tuner.frozen_at_step == 12
         assert '2.self_attn' in session.executed_policy.resident_regions
         assert all(a is b for a, b in zip(parameters, model.parameters()))
+
+
+def test_generic_gated_adapter_preserves_original_forward_backward_and_rng():
+    from copy import deepcopy
+    from mindspeed.core.memory.hyper_offload.tuning.regions import decoder_recompute_regions
+    torch.manual_seed(541)
+    reference = torch.nn.Sequential(FineBlock(), FineBlock())
+    candidate = deepcopy(reference)
+    regions = decoder_recompute_regions(candidate, layout='gated')
+    x = torch.randn(3, 16)
+    for selected in ((), ('0.mlp.pointwise', '1.input_layernorm'), ('0',)):
+        reference.zero_grad(set_to_none=True)
+        candidate.zero_grad(set_to_none=True)
+        regions.apply(selected)
+        torch.manual_seed(98)
+        expected = reference(x).square().sum()
+        expected.backward()
+        rng = torch.get_rng_state().clone()
+        torch.manual_seed(98)
+        actual = candidate(x).square().sum()
+        actual.backward()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.equal(torch.get_rng_state(), rng)
+        for left, right in zip(candidate.parameters(), reference.parameters()):
+            torch.testing.assert_close(left.grad, right.grad, rtol=0, atol=0)
+
+
+class ParallelMLP(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.expand=torch.nn.Linear(16,32)
+        self.act=torch.nn.GELU()
+        self.project=torch.nn.Linear(32,16)
+    def forward(self,x):
+        return self.project(self.act(self.expand(x)))
+
+
+class ParallelBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention=torch.nn.Sequential(torch.nn.Linear(16,16),torch.nn.Dropout(.2))
+        self.mlp=ParallelMLP()
+        self.input_layernorm=torch.nn.LayerNorm(16)
+        self.post_attention_layernorm=torch.nn.LayerNorm(16)
+        self.output_dropout=torch.nn.Dropout(.3)
+    def forward(self,x):
+        attention=self.attention(self.input_layernorm(x))
+        hidden=self.output_dropout(self.mlp(self.post_attention_layernorm(x)))
+        return x+attention+hidden
+
+
+def test_parallel_branch_adapter_preserves_updates_rng_and_cached_restore():
+    # Adapter contract test with a synthetic parallel-residual network. It does
+    # not consume held-out model traces, measurements or tuning decisions.
+    from mindspeed.core.memory.hyper_offload.tuning.regions import decoder_recompute_regions
+    torch.manual_seed(31)
+    reference=torch.nn.Sequential(*(ParallelBlock() for _ in range(3)))
+    model=deepcopy(reference)
+    regions=decoder_recompute_regions(model,layout='parallel_mlp')
+    original_parameters=tuple(model.parameters())
+    initial=JointPolicy(0,64,recompute_regions=('0','1.mlp'),resident_regions=('2.attention',))
+    candidate=JointPolicy(0,64,recompute_regions=('0.mlp.act','1.attention','2.post_attention_layernorm'),
+                          resident_regions=('0.attention','2.mlp'))
+    tuner=JointTuningController(initial,lambda trials:candidate if len(trials)==1 else None,TuningLimits(max_steps=12))
+    ref_opt=torch.optim.SGD(reference.parameters(),lr=.001);opt=torch.optim.SGD(model.parameters(),lr=.001)
+    inputs=torch.randn(2,4,16)
+    with cpu_runtime():
+        session=JointOffloadSession(tuner,apply_policy=regions.apply_policy,host_mb=64)
+        for step in range(13):
+            ref_opt.zero_grad(set_to_none=True);opt.zero_grad(set_to_none=True)
+            a,b=inputs.clone().requires_grad_(),inputs.clone().requires_grad_()
+            torch.manual_seed(300+step)
+            expected=reference(a).square().mean();expected.backward();expected_rng=torch.get_rng_state().clone()
+            torch.manual_seed(300+step)
+            with session:
+                actual=model(b).square().mean();actual.backward()
+            assert torch.equal(torch.get_rng_state(),expected_rng)
+            torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+            torch.testing.assert_close(b.grad,a.grad,rtol=0,atol=0)
+            for p,q in zip(model.parameters(),reference.parameters()):torch.testing.assert_close(p.grad,q.grad,rtol=0,atol=0)
+            ref_opt.step();opt.step()
+            for p,q in zip(model.parameters(),reference.parameters()):torch.testing.assert_close(p,q,rtol=0,atol=0)
+            del actual,expected,a,b
+            if not session.stable:session.observe(StepObservation(1. if session.executed_policy==initial else 2.,0,0))
+        assert tuner.stable and tuner.frozen_at_step<=12 and session.executed_policy==initial
+        assert session.trace_collections==2 and session.plan_builds==2
+        assert all(a is b for a,b in zip(original_parameters,model.parameters()))
+
+
+def test_direct_fixed_control_has_no_tuning_observations_and_exact_replay():
+    import importlib.util
+    from pathlib import Path
+    from unittest.mock import Mock
+    root=next(p for p in Path(__file__).resolve().parents if (p/'tools/hyper_offload/fixed_control.py').exists())
+    spec=importlib.util.spec_from_file_location('fixed_control',root/'tools/hyper_offload/fixed_control.py')
+    control=importlib.util.module_from_spec(spec);spec.loader.exec_module(control)
+    torch.manual_seed(58)
+    reference=Model();model=deepcopy(reference)
+    regions=LayerRecomputeRegions(model.layers)
+    proposal=Mock(side_effect=AssertionError('a direct fixed control must not search'))
+    tuner=JointTuningController(JointPolicy(2,64,trim_replay_interval=2),proposal)
+    control.make_direct_fixed(tuner)
+    tuner.observe=Mock(side_effect=AssertionError('a direct fixed control must not observe'))
+    opt=torch.optim.SGD(model.parameters(),lr=.001);ref_opt=torch.optim.SGD(reference.parameters(),lr=.001)
+    inputs=torch.randn(3,16)
+    with cpu_runtime():
+        session=JointOffloadSession(tuner,regions.apply,host_mb=64)
+        for step in range(12):
+            opt.zero_grad(set_to_none=True);ref_opt.zero_grad(set_to_none=True)
+            x,x_ref=inputs.clone().requires_grad_(),inputs.clone().requires_grad_()
+            torch.manual_seed(700+step);expected=reference(x_ref);expected.backward();rng=torch.get_rng_state().clone()
+            torch.manual_seed(700+step)
+            with session:
+                actual=model(x);actual.backward()
+            if step==0:snapshot=control.finish_direct_warmup(session)
+            torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+            torch.testing.assert_close(x.grad,x_ref.grad,rtol=0,atol=0)
+            assert torch.equal(torch.get_rng_state(),rng)
+            for a,b in zip(model.parameters(),reference.parameters()):torch.testing.assert_close(a.grad,b.grad,rtol=0,atol=0)
+            opt.step();ref_opt.step()
+            for a,b in zip(model.parameters(),reference.parameters()):torch.testing.assert_close(a,b,rtol=0,atol=0)
+            del actual,expected,x,x_ref
+        assert session.stable and session.trace_collections==session.plan_builds==1
+        assert not session._plans and not session._traces
+        assert tuner.steps==tuner.frozen_at_step==0
+        assert snapshot['timing_events']==session.timing_events
+        assert snapshot['timing_event_count']==len(session.timing_events)
+        assert snapshot['observation_and_consensus_seconds']==snapshot['search_seconds']==0
+        proposal.assert_not_called();tuner.observe.assert_not_called()
+
+
+def _load_legacy_qwen_candidate():
+    # Megatron also exports an examples package; load the local fixture by path.
+    import importlib.util
+    from pathlib import Path
+    relative = 'examples/qwen25_32b_fsdp2_a2/native_fsdp2/legacy_tuning.py'
+    root = next(p for p in Path(__file__).resolve().parents if (p / relative).is_file())
+    spec = importlib.util.spec_from_file_location('hyperoffload_legacy_qwen_fixture', root / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.QwenRegionNeighborhood
+
+
+QwenRegionNeighborhood = _load_legacy_qwen_candidate()

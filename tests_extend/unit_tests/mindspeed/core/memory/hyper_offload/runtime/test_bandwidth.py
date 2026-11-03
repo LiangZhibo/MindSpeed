@@ -42,3 +42,28 @@ class TestProfileTransferBandwidth(unittest.TestCase):
             ):
                 with self.assertRaises(RuntimeError):
                     profile_transfer_bandwidth()
+
+
+    def test_warmup_and_isolated_delay_do_not_choose_policy_bandwidth(self):
+        samples = [100., 100., 1., 2., 1., 2., 1., 2., 50., 60., 1., 2.]
+        diagnostics = {}
+        with patch('torch.accelerator.is_available', return_value=True), \
+             patch('torch.accelerator.current_accelerator', return_value='cpu'), \
+             patch('mindspeed.core.memory.hyper_offload.runtime.bandwidth.torch.empty', return_value=MagicMock()), \
+             patch('mindspeed.core.memory.hyper_offload.runtime.bandwidth.DeviceTimer') as timer:
+            timer.return_value.stop.side_effect = samples
+            result = profile_transfer_bandwidth(diagnostics=diagnostics)
+        self.assertEqual(result, (15.625, 7.8125))
+        self.assertEqual(diagnostics['warmup_ms'], (100., 100.))
+        self.assertEqual(diagnostics['d2h_samples_ms'], (1., 1., 1., 50., 1.))
+        self.assertEqual(diagnostics['h2d_samples_ms'], (2., 2., 2., 60., 2.))
+        self.assertGreaterEqual(diagnostics['elapsed_seconds'], 0.)
+
+    def test_persistent_slower_transfer_is_retained(self):
+        with patch('torch.accelerator.is_available', return_value=True), \
+             patch('torch.accelerator.current_accelerator', return_value='cpu'), \
+             patch('mindspeed.core.memory.hyper_offload.runtime.bandwidth.torch.empty', return_value=MagicMock()), \
+             patch('mindspeed.core.memory.hyper_offload.runtime.bandwidth.DeviceTimer') as timer:
+            timer.return_value.stop.side_effect = [1., 1., 1., 4., 1., 4., 1., 4., 1., 1., 1., 1.]
+            result = profile_transfer_bandwidth()
+        self.assertEqual(result, (15.625, 3.90625))
