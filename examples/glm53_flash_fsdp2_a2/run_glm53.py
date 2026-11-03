@@ -170,8 +170,28 @@ def main() -> None:
             install_transfer_counters(engine._glm53_offload_session)
         session = engine._glm53_offload_session
         engine._glm53_phase_for_log = session.mode
-        with session:
-            return original_step(engine, train_dataloader_iter)
+        try:
+            with session:
+                return original_step(engine, train_dataloader_iter)
+        except Exception:
+            counters = session._glm53_transfer_counters
+            manager = session.residency_manager
+            print(
+                "[glm53] HyperOffload failure diagnostics "
+                f"phase={session.mode} d2h_calls={counters['d2h_calls']} "
+                f"d2h_bytes={counters['d2h_bytes']} h2d_calls={counters['h2d_calls']} "
+                f"h2d_bytes={counters['h2d_bytes']} resident_activation_bytes={manager.resident_bytes}",
+                flush=True,
+            )
+            try:
+                print(
+                    "[glm53] NPU failure memory "
+                    f"allocated={torch.npu.memory_allocated()} reserved={torch.npu.memory_reserved()}",
+                    flush=True,
+                )
+            except Exception as memory_error:  # NPU may reject queries after a device failure.
+                print(f"[glm53] NPU memory query failed: {memory_error}", flush=True)
+            raise
 
     @wraps(original_log)
     def instrumented_log(engine, iteration, elapsed_time_per_iteration, *call_args, **kwargs):
