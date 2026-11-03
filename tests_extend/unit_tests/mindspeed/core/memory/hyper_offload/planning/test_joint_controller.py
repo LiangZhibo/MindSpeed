@@ -1,9 +1,57 @@
 """Budget and qualification tests for the pure joint tuning controller."""
 import unittest
+from unittest.mock import patch
+
+import pytest
 
 from mindspeed.core.memory.hyper_offload.tuning import (
     JointPolicy, JointTuningController, StepObservation, TuningLimits,
 )
+
+
+@pytest.mark.parametrize('boundary', ['before_proposal', 'after_proposal'])
+def test_shared_search_budget_keeps_straddling_rank_clocks_on_same_branch(boundary):
+    initial, candidate = JointPolicy(2, 64), JointPolicy(1, 64)
+    decisions = []
+    for local_seconds in (9.999, 10.001):
+        reduced, proposed = [], []
+        def reduce_seconds(value):
+            reduced.append(value)
+            return 0. if boundary == 'after_proposal' and len(reduced) == 1 else 10.001
+        def propose(trials):
+            proposed.append(len(trials))
+            tuner.search_seconds = local_seconds
+            return candidate
+        tuner = JointTuningController(initial, propose,
+            TuningLimits(max_steps=12, max_search_seconds=10.), search_time_reducer=reduce_seconds)
+        with patch('mindspeed.core.memory.hyper_offload.tuning.controller.time.perf_counter', return_value=0.):
+            for _ in range(2):
+                tuner.observe(StepObservation(10., 0, 0))
+            tuner.search_seconds = local_seconds if boundary == 'before_proposal' else 0.
+            tuner.observe(StepObservation(10., 0, 0))
+            assert tuner.phase == 'confirm' and tuner.policy == initial
+            assert tuner.stop_reason == 'search_time_budget'
+            for _ in range(2):
+                tuner.observe(StepObservation(10., 0, 0))
+            assert tuner.stable
+            calls = len(reduced)
+            for _ in range(5):
+                tuner.observe(StepObservation(10., 0, 0))
+            assert len(reduced) == calls
+        decisions.append((tuner.phase, tuner.policy, tuner.frozen_at_step, len(proposed), calls))
+    assert decisions[0] == decisions[1]
+    assert decisions[0][-2:] == ((0, 1) if boundary == 'before_proposal' else (1, 2))
+
+
+@pytest.mark.parametrize('invalid', [True, None, -1., float('nan'), float('inf'), 0.5])
+def test_search_budget_reducer_cannot_hide_elapsed_time(invalid):
+    tuner = JointTuningController(JointPolicy(2, 64), lambda _: None,
+        search_time_reducer=lambda _: invalid)
+    tuner.search_seconds = 1.
+    tuner.observe(StepObservation(10., 0, 0))
+    tuner.observe(StepObservation(10., 0, 0))
+    with pytest.raises(ValueError, match='finite upper bound'):
+        tuner.observe(StepObservation(10., 0, 0))
 
 
 class TestJointController(unittest.TestCase):
@@ -390,3 +438,75 @@ def test_tentative_confirmation_requires_validation_mode_and_valid_capacity():
     with pytest.raises(RuntimeError, match='failed confirmation'):
         tuner.observe(StepObservation(8, 100, 200, False))
     assert not tuner.stable
+
+
+def earlier_challenger_case(*, budget=18, enabled=True, incumbent_cycle=1, challenger_cycle=1):
+    policies = [JointPolicy(0, 8, recompute_regions=(name,), trim_replay_interval=cycle)
+                for name, cycle in [('encoder', 1), ('projection', incumbent_cycle),
+                                    ('activation', challenger_cycle), ('other', 1)]]
+    tuner = JointTuningController(policies[0], lambda trials:policies[len(trials)],
+        TuningLimits(max_steps=budget,max_candidates=4,confirmation_steps=4,
+                     timing_noise_multiplier=1.,validate_confirmation_timing=True,
+                     confirm_best_observed=enabled))
+    # An earlier challenger has a better mean but overlapping two-sample
+    # variation. A later slow candidate must not erase its confirmation chance.
+    observe_costs(tuner,[99.,9.9,10.1,99.,8.9,9.1,99.,8.4,9.2,99.,12.,12.])
+    return tuner,policies
+
+
+@pytest.mark.parametrize('incumbent_cycle',[1,2])
+def test_earlier_lowest_score_receives_independent_confirmation_with_restore(incumbent_cycle):
+    tuner,policies=earlier_challenger_case(incumbent_cycle=incumbent_cycle)
+    assert tuner.phase=='restore' and tuner.policy==policies[2]
+    assert tuner.confirmation_reference_index==1 and tuner.confirmation_target==4
+    assert tuner.selection_log[-1]['strict_best_index']==1
+    assert tuner.selection_log[-1]['selected_index']==2
+    observe_costs(tuner,[99.])
+    assert tuner.phase=='confirm' and not tuner.confirmation
+    observe_costs(tuner,[8.7]*4)
+    assert tuner.stable and tuner.policy==policies[2] and tuner.frozen_at_step==17
+    frozen=tuner.steps,tuner.search_seconds,len(tuner.selection_log)
+    observe_costs(tuner,[99.]*10)
+    assert frozen==(tuner.steps,tuner.search_seconds,len(tuner.selection_log))
+
+
+def test_earlier_challenger_keeps_gain_guard_and_reserved_fallback_step():
+    tuner,policies=earlier_challenger_case()
+    observe_costs(tuner,[99.,8.9,8.9,8.9,8.9])
+    # It remains faster than the incumbent mean, but does not clear the
+    # unchanged relative-gain and observed-spread margin.
+    assert tuner.phase=='fallback' and tuner.policy==policies[1]
+    observe_costs(tuner,[9.])
+    assert tuner.stable and tuner.frozen_at_step==18 and tuner.confirmation_fallback
+
+
+@pytest.mark.parametrize('budget,enabled',[(17,True),(18,False)])
+def test_earlier_confirmation_requires_full_restore_confirm_fallback_budget(budget,enabled):
+    tuner,policies=earlier_challenger_case(budget=budget,enabled=enabled)
+    assert tuner.policy==policies[1] and tuner.phase=='restore'
+    assert not tuner.selection_log[-1]['tentative_confirmation']
+    while not tuner.stable:
+        tuner.observe(StepObservation(9.,1,1))
+    assert tuner.steps<=budget
+
+
+def test_best_observed_confirmation_option_is_boolean():
+    with pytest.raises(ValueError,match='confirm_best_observed'):
+        TuningLimits(confirm_best_observed='yes')
+
+
+def test_earlier_periodic_challenger_uses_complete_confirmation_cycles():
+    policies=[JointPolicy(0,8,recompute_regions=(name,),trim_replay_interval=cycle)
+              for name,cycle in [('encoder',1),('projection',1),('activation',2),('other',1)]]
+    tuner=JointTuningController(policies[0],lambda trials:policies[len(trials)],
+        TuningLimits(max_steps=18,max_candidates=4,confirmation_steps=3,
+                     timing_noise_multiplier=1.,validate_confirmation_timing=True,
+                     confirm_best_observed=True))
+    observe_costs(tuner,[99.,9.9,10.1,99.,8.9,9.1,99.,8.92,8.98,99.,12.,12.])
+    assert tuner.phase=='restore' and tuner.policy==policies[2]
+    assert tuner.selection_log[-1]['tentative_confirmation']
+    assert tuner.confirmation_target==4
+    observe_costs(tuner,[99.,8.6,8.8,8.6])
+    assert not tuner.stable and len(tuner.confirmation)==3
+    observe_costs(tuner,[8.8])
+    assert tuner.stable and tuner.frozen_at_step==17 and tuner.policy==policies[2]
