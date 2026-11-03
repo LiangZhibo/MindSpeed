@@ -4,6 +4,7 @@
 import argparse
 from functools import wraps
 import json
+import os
 import runpy
 import sys
 import time
@@ -140,8 +141,15 @@ def main() -> None:
             module.forward = skip_offload(module.forward)
         print(f"[glm53] HyperOffload opaque hyperconnections={','.join(name for name, _ in hc_modules)}", flush=True)
 
-        attention_modules = [(name, module) for name, module in modules.items()
-                             if name.endswith(".self_attn") and ".language_model.layers." in name]
+        disabled_layers = {
+            int(item) for item in os.environ.get("GLM53_DISABLE_RECOMPUTE_LAYERS", "").split(",")
+            if item.strip()
+        }
+        attention_modules = [
+            (name, module) for name, module in modules.items()
+            if name.endswith(".self_attn") and ".language_model.layers." in name
+            and int(name.split(".language_model.layers.", 1)[1].split(".", 1)[0]) in disabled_layers
+        ]
         if not attention_modules:
             raise RuntimeError("HyperOffload found no GLM attention modules")
         for _, module in attention_modules:
