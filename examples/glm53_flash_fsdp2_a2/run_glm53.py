@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 import torch_npu  # noqa: F401
 import yaml
+from torch.utils._python_dispatch import _disable_current_modes
 
 def install_transfer_counters(session) -> None:
     manager = session.residency_manager
@@ -93,6 +94,17 @@ def main() -> None:
 
     original_step = TrainEngine.train_step
     original_log = TrainEngine.training_log
+    original_get_batch = TrainEngine.get_batch
+
+    @wraps(original_get_batch)
+    def instrumented_get_batch(engine, train_dataloader_iter):
+        if not is_hyperoffload:
+            return original_get_batch(engine, train_dataloader_iter)
+        # DataLoader workers are created lazily on the first next(). Forking
+        # while TorchDispatchMode is active makes workers inherit the mode and
+        # sends CPU-side preprocessing through the activation tracker.
+        with _disable_current_modes():
+            return original_get_batch(engine, train_dataloader_iter)
 
     def prepare_skip_regions(engine):
         if getattr(engine, "_glm53_skip_regions_ready", False):
@@ -170,6 +182,7 @@ def main() -> None:
 
     TrainEngine.train_step = instrumented_step
     TrainEngine.training_log = instrumented_log
+    TrainEngine.get_batch = instrumented_get_batch
 
     import mindspeed_mm
     trainer_path = Path(mindspeed_mm.__file__).resolve().parent / "fsdp/train/trainer.py"
