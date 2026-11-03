@@ -68,6 +68,37 @@ class PhaseMemoryObserver:
             handle.remove()
         self._handles.clear()
 
+    def observe_callable(self, name, result):
+        """Observe a certified callable after its opaque forward boundary.
+
+        Unlike a module hook inside the boundary, a tensor gradient hook here
+        would run *before* opaque backward entry and record the wrong op. A
+        node post-hook only accepts the exact corresponding opaque backward;
+        unfamiliar autograd wrappers leave an unknown lifetime, never a guess.
+        This opt-in path is used by candidate-aware exploration only.
+        """
+        if self.closed or name not in self.regions.selected or name not in self.regions._callables:
+            return
+        function = self.executor._last_func
+        forward_name = getattr(function, '__name__', '')
+        if self.executor.in_opaque_region or not forward_name.endswith('_fwd'):
+            return
+        row = dict(name=name, forward_op=self.executor.op_idx, backward_ops=[])
+        self.regions_seen.setdefault(name, []).append(row)
+        expected = forward_name[:-4] + '_bwd'
+        seen = set()
+        for value in tree_flatten(result)[0]:
+            node = value.grad_fn if isinstance(value, torch.Tensor) and value.requires_grad else None
+            if node is None or node in seen:
+                continue
+            seen.add(node)
+            def backward(grad_inputs, grad_outputs, row=row, expected=expected):
+                if (self.executor.in_opaque_region
+                        and getattr(self.executor._last_func, '__name__', '') == expected
+                        and self.executor.op_idx not in row['backward_ops']):
+                    row['backward_ops'].append(self.executor.op_idx)
+            self._gradient_handles.append(node.register_hook(backward))
+
     def _after_op(self, result):
         value = self._original_end(result)
         started = time.perf_counter()

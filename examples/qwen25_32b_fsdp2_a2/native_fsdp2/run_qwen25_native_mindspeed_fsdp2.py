@@ -101,13 +101,19 @@ def parse_args():
     parser.add_argument("--offload-planner", choices=("peak", "greedy"), default="peak")
     parser.add_argument("--offload-communication-masking", action="store_true")
     parser.add_argument("--hyper-offload-autotune", action="store_true")
-    parser.add_argument("--offload-tuning-method", choices=("legacy", "measured"), default="measured")
+    parser.add_argument("--offload-tuning-method", choices=("legacy", "measured", "explore"), default="measured")
     parser.add_argument("--offload-transfer-size-calibration", action="store_true",
                         help="Calibrate observed transfer sizes during bounded warmup")
     parser.add_argument("--offload-joint-refinement", action="store_true",
                         help="Test a joint region/cadence refinement in the second candidate slot")
-    parser.add_argument("--offload-tuning-steps", type=int, default=10)
-    parser.add_argument("--offload-tuning-candidates", type=int, default=3)
+    parser.add_argument("--offload-disable-compression", action="store_true",
+                        help="Disable native calibration and codec candidates in exploration")
+    parser.add_argument("--offload-compression-library",
+                        help="Native SplitZip library; otherwise use MINDSPEED_SPLITZIP_LIBRARY")
+    parser.add_argument("--offload-tuning-steps", type=int)
+    parser.add_argument("--offload-tuning-candidates", type=int)
+    parser.add_argument("--offload-tuning-search-seconds", type=float, default=180.,
+                        help="Exploration search-compute budget; separate from training-step budget")
     parser.add_argument("--offload-window-probe-multiplier", type=float, default=8.0)
     parser.add_argument("--offload-window-probe-unlimited-prefetch", action="store_true")
     parser.add_argument(
@@ -140,7 +146,12 @@ def parse_args():
     parser.add_argument("--extra-steps", type=int, default=0)
     parser.add_argument("--use-torch-fsdp2", action="store_true", required=True)
     parser.add_argument("--fsdp2-config-path", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.offload_tuning_steps is None:
+        args.offload_tuning_steps = 40 if args.offload_tuning_method == 'explore' else 10
+    if args.offload_tuning_candidates is None:
+        args.offload_tuning_candidates = 11 if args.offload_tuning_method == 'explore' else 3
+    return args
 
 
 def log(rank, message):
@@ -283,7 +294,7 @@ def main():
         raise ValueError("joint tuning requires --hyper-offload")
     if (
         args.hyper_offload_autotune
-        and (args.offload_tuning_method == 'measured' or args.offload_tuning_probe.endswith('_resident'))
+        and (args.offload_tuning_method in ('measured', 'explore') or args.offload_tuning_probe.endswith('_resident'))
         and args.offload_tuning_device_peak_mb is None
     ):
         raise ValueError('resident-region tuning requires an explicit whole-device peak limit')
@@ -318,7 +329,6 @@ def main():
     if args.hyper_offload:
         if args.hyper_offload_autotune:
             from mindspeed.core.memory.hyper_offload.tuning import JointPolicy, JointTuningController, TuningLimits
-            from legacy_tuning import QwenRegionNeighborhood
             from mindspeed.core.memory.hyper_offload.tuning.session import JointOffloadSession
 
             count = (
@@ -329,7 +339,19 @@ def main():
             limits = TuningLimits(max_steps=args.offload_tuning_steps,max_candidates=args.offload_tuning_candidates,
                 device_peak_bytes=None if args.offload_tuning_device_peak_mb is None else args.offload_tuning_device_peak_mb * 1024**2,
                 host_peak_bytes=args.offload_host_mb * 1024**2)
-            if args.offload_tuning_method == 'measured':
+            if args.offload_tuning_method == 'explore':
+                if args.offload_region_layout == 'legacy_qwen':
+                    raise ValueError('exploration requires an explicit certified structural adapter')
+                from dataclasses import replace
+                from mindspeed.core.memory.hyper_offload.tuning.exploration_session import ExplorationOffloadSession
+                limits = replace(limits, confirmation_steps=4,
+                                 max_search_seconds=args.offload_tuning_search_seconds)
+                session = ExplorationOffloadSession(initial, model=engine, regions=engine._hyper_offload_regions,
+                    limits=limits, host_mb=args.offload_host_mb,
+                    transfer_size_calibration=args.offload_transfer_size_calibration,
+                    enable_compression=not args.offload_disable_compression,
+                    compression_library=args.offload_compression_library)
+            elif args.offload_tuning_method == 'measured':
                 if args.offload_region_layout == 'legacy_qwen':
                     raise ValueError('measured tuning requires an explicit gated or parallel_mlp structural adapter')
                 from mindspeed.core.memory.hyper_offload.tuning.measured_session import MeasuredOffloadSession
@@ -338,6 +360,7 @@ def main():
                                                 transfer_size_calibration=args.offload_transfer_size_calibration,
                                                 joint_refinement=args.offload_joint_refinement)
             else:
+                from legacy_tuning import QwenRegionNeighborhood
                 controller = JointTuningController(initial,QwenRegionNeighborhood(
                     args.layers,count,probe=args.offload_tuning_probe,
                     resident_mlp_fraction=args.offload_resident_mlp_fraction,
@@ -453,6 +476,11 @@ def main():
             cache_reclaim_observation_enabled=session.record_cache_reclaim,
             proposal_compute_seconds=getattr(session,'proposal_compute_seconds',None),
             proposal_consensus_seconds=getattr(session,'proposal_consensus_seconds',None),
+            queue_analysis_seconds=getattr(session,'queue_analysis_seconds',None),
+            observer_collections=getattr(session,'observer_collections',None),
+            compression_calibration=getattr(session,'compression_report',None),
+            calibration_consensus_seconds=getattr(session,'calibration_consensus_seconds',None),
+            exploration_diagnostics=getattr(getattr(session,'neighborhood',None),'diagnostics',None),
             phase_sample_count=len((getattr(session,'phase_report',None) or {}).get('samples',())),
             region_observation_count=len((getattr(session,'region_report',None) or {}).get('regions',())),
             switch_drain_seconds=session.switch_drain_seconds,
@@ -463,6 +491,7 @@ def main():
             phase=session.controller.phase,
             steps=session.controller.steps,
             frozen_at_step=session.controller.frozen_at_step,
+            stop_reason=session.controller.stop_reason,
             policy=asdict(session.controller.policy),
             search_seconds=session.controller.search_seconds,
             confirmation_target=session.controller.confirmation_target,
@@ -584,6 +613,10 @@ def main():
             result.update(offload_stats)
             result["host_pool_allocated_gib"] = session.residency_manager._host_pool.total_allocated / 2**30
             result["host_pool_pageable_gib"] = session.residency_manager._host_pool.pageable_allocated / 2**30
+            if hasattr(session, 'compression_report'):
+                result['compression_calibration'] = session.compression_report
+                backend = getattr(session, '_codec_backend', None)
+                result['compression_runtime_stats_final'] = dict(backend.stats) if backend is not None else None
         result.update(
             elapsed_seconds=time.perf_counter() - started,
             npu_peak_allocated_gib=torch.npu.max_memory_allocated() / 2**30,

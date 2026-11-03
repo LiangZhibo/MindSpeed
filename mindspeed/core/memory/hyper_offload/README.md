@@ -19,5 +19,8 @@ imports, an opt-in feature and Megatron schedule adapter, argument validation, t
 and portable CPU / real accelerator tests. Baseline and offloaded models have independent
 weights, and accelerator memory measurements clear gradients symmetrically.
 
-The first release manages activations only. Parameter/optimizer offload, arbitrary changing
-operator sequences, joint recomputation planning and graph capture are outside its support claim.
+The runtime manages activations only. An explicit exploration session can change certified
+recomputation regions between complete training steps, collect a fresh trace, compare selective
+lossless transport candidates and freeze within a finite budget. See the feature guide for its
+observation and capacity contracts. Parameter/optimizer offload, arbitrary changing operator
+sequences and graph capture remain outside this support claim.

@@ -112,6 +112,7 @@ class TuningLimits:
     minimum_relative_gain: float = 0.005
     timing_noise_multiplier: float = 0.0
     validate_confirmation_timing: bool = False
+    confirm_best_observed: bool = False
 
     def __post_init__(self):
         for name in ('max_steps', 'max_candidates', 'samples_per_candidate', 'confirmation_steps'):
@@ -128,6 +129,8 @@ class TuningLimits:
             raise ValueError('timing_noise_multiplier must be finite and nonnegative')
         if not isinstance(self.validate_confirmation_timing, bool):
             raise ValueError('validate_confirmation_timing must be a boolean')
+        if not isinstance(self.confirm_best_observed, bool):
+            raise ValueError('confirm_best_observed must be a boolean')
         for name in ('device_peak_bytes', 'host_peak_bytes'):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
@@ -184,6 +187,8 @@ class JointTuningController:
     ``propose`` receives completed trials and returns one next candidate or
     None. It must be a cheap, synchronous policy proposal, not a GPU benchmark.
     The same reduced observations must be supplied on all participating ranks.
+    Distributed callers may also supply ``search_time_reducer`` to return the
+    maximum elapsed search time across ranks before each budget decision.
     A failed training iteration itself must be handled by the training loop;
     this controller never treats a partially executed step as recoverable.
     """
@@ -193,7 +198,12 @@ class JointTuningController:
         initial: JointPolicy,
         propose: Callable[[tuple[Trial, ...]], JointPolicy | None],
         limits: TuningLimits | None = None,
+        *,
+        search_time_reducer: Callable[[float], float] | None = None,
     ):
+        if search_time_reducer is not None and not callable(search_time_reducer):
+            raise TypeError('search_time_reducer must be callable')
+        self._search_time_reducer = search_time_reducer
         self.limits = limits or TuningLimits()
         self.policy = initial
         self.phase = 'warmup'
@@ -337,6 +347,18 @@ class JointTuningController:
         # two samples. Independent stable-step runs establish final speed.
         return challenger.score < incumbent.score - margin
 
+    def _budget_seconds(self, local_seconds):
+        # Distributed callers must agree before entering a proposal collective
+        # and before deciding whether to execute its returned candidate. Local
+        # wall clocks alone can take different branches at the time boundary.
+        if self._search_time_reducer is None:
+            return local_seconds
+        result = self._search_time_reducer(local_seconds)
+        if (isinstance(result, bool) or not isinstance(result, (int, float))
+                or not math.isfinite(result) or result < local_seconds):
+            raise ValueError('search time reduction must return a finite upper bound')
+        return result
+
     def _finish_trial(self):
         self.trials.append(self._trial)
         # Preserve the earlier measured incumbent for near ties. With only a
@@ -354,17 +376,20 @@ class JointTuningController:
         # Reserve one candidate warmup, its samples, a possible return-to-best
         # settling iteration and final confirmation before requesting any work.
         needed = self._search_steps(best.policy)
+        used_seconds = self._budget_seconds(self.search_seconds)
         can_search = (
             self.steps + needed <= self.limits.max_steps
             and len(self.trials) < self.limits.max_candidates
-            and self.search_seconds < self.limits.max_search_seconds
+            and used_seconds < self.limits.max_search_seconds
         )
         candidate = None
+        if used_seconds >= self.limits.max_search_seconds:
+            self.stop_reason = 'search_time_budget'
         if can_search:
             started = time.perf_counter()
             candidate = self._propose(tuple(self.trials))
             proposal_seconds = time.perf_counter() - started
-            if self.search_seconds + proposal_seconds >= self.limits.max_search_seconds:
+            if self._budget_seconds(self.search_seconds + proposal_seconds) >= self.limits.max_search_seconds:
                 candidate = None
                 self.stop_reason = 'search_time_budget'
             if candidate is not None and not isinstance(candidate, JointPolicy):
@@ -383,18 +408,22 @@ class JointTuningController:
         self.stop_reason = self.stop_reason or ('proposal_exhausted' if can_search else 'tuning_budget')
         self.confirmation_reference_index = prior_best_index if self._cycle_steps(best.policy) > 1 else 0
         strict_best_index = best_index
-        tentative = self.trials[-1]
+        tentative = (min(self.trials, key=lambda trial:trial.score)
+                     if self.limits.confirm_best_observed else self.trials[-1])
+        tentative_restore = int(tentative.policy != self.policy)
         tentative_confirmation = (
             self.limits.validate_confirmation_timing
             and tentative is not best
-            and tentative.policy == self.policy
+            and (self.limits.confirm_best_observed or not tentative_restore)
             and tentative.score < best.score
-            and self._cycle_steps(best.policy) == 1
-            and self.steps + self._confirmation_steps(tentative.policy) + 1 <= self.limits.max_steps
+            and (self.limits.confirm_best_observed or self._cycle_steps(best.policy) == 1)
+            and self.steps + tentative_restore + self._confirmation_steps(tentative.policy) + 1
+                <= self.limits.max_steps
         )
         if tentative_confirmation:
-            # Spend the remaining complete confirmation window on the current
-            # lower-score challenger before paying to restore the incumbent.
+            # Spend one complete confirmation window on a lower-score
+            # challenger. Exploration may revisit an earlier observation,
+            # including the restore step in its bounded finish cost.
             # The same gain/noise margin still gates acceptance, and a full
             # validation step is reserved for the measured fallback policy.
             self.confirmation_reference_index = best_index
