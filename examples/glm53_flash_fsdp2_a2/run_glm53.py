@@ -134,7 +134,7 @@ def main() -> None:
         modeling = importlib.import_module(
             "mindspeed_mm.fsdp.models.glm5_next.modeling_glm5_next"
         )
-        for function_name in ("hc_split_sinkhorn", "causal_conv1d"):
+        for function_name in ("hc_split_sinkhorn", "causal_conv1d", "chunk_kda_ascendc"):
             function = getattr(modeling, function_name, None)
             if function is None:
                 raise RuntimeError(f"HyperOffload cannot find GLM kernel function {function_name}")
@@ -142,7 +142,11 @@ def main() -> None:
                 wrapped_function = skip_offload(function, track_backward_inputs=True)
                 wrapped_function._glm53_skip_offload = True
                 setattr(modeling, function_name, wrapped_function)
-        print("[glm53] HyperOffload opaque custom kernels=hc_split_sinkhorn,causal_conv1d", flush=True)
+        print(
+            "[glm53] HyperOffload opaque custom kernels="
+            "hc_split_sinkhorn,causal_conv1d,chunk_kda_ascendc",
+            flush=True,
+        )
 
     @wraps(original_step)
     def instrumented_step(engine, train_dataloader_iter):
