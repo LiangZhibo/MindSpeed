@@ -108,3 +108,7 @@ session = OffloadSession(OffloadConfig(
 自定义联合候选可用 `JointOffloadSession(codecs={...})` 注册不可变的传输配置，并在 `JointPolicy.codec_key` 中引用。`raw` 为保留键。`MeasuredJointNeighborhood` 与 `calibrated_transport.py` 是可复用的成本组件。`ExplorationOffloadSession` 的自动压缩接线位于 `codec_calibration.py` 和 `selective_codec.py`：真实BF16样本仅在初始warmup有界采集；同一会话使用固定码本，节点选择器绑定执行图；无兼容原生库或校准未通过时明确记录原因并继续raw候选。包复用默认关闭；压缩率不能用于折扣最坏临时空间或Host预留容量。
 
 `tools/hyper_offload/compression_applicability.py` 提供有界真实激活诊断；带采样和校准的实验不计训练性能。`splitzip_basic_trial.py` 提供原生资格和小模型对照。`audit_results.py --pairs MANIFEST --protocol PROTOCOL` 要求显式冻结统计协议，拒绝复制运行和不匹配证据。
+
+## 全局探索实测结果
+
+见[hyper-offload-exploration-validation-20261104.md](hyper-offload-exploration-validation-20261104.md)：三组同卡新旧自动对照、实际最终策略的完整调优成本、压缩执行及时间线证据。8.5秒基础目标和8.0秒挑战目标未达到，限制与未验证范围分别保留。
