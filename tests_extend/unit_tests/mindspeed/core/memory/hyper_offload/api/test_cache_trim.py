@@ -16,7 +16,10 @@
 
 from unittest.mock import patch
 
+import torch
+
 from mindspeed.core.memory.hyper_offload import OffloadConfig, OffloadSession
+from mindspeed.core.memory.hyper_offload.api.session import ActivationDispatchMode
 from mindspeed.core.memory.hyper_offload.execution.replay import ReplayExecutor
 from mindspeed.core.memory.hyper_offload.ir.schedule import ResidencySchedule
 
@@ -29,7 +32,7 @@ def test_replay_trims_cache_before_entry():
     original_reset = session.executor.reset
 
     def reset_after_trim():
-        empty_cache.assert_called_once_with()
+        empty_cache.assert_called_once_with(retain_physical=True)
         original_reset()
 
     # Transfer-stream synchronization is independent of cache trimming and
@@ -40,8 +43,8 @@ def test_replay_trims_cache_before_entry():
         patch.object(session.executor, "reset", side_effect=reset_after_trim),
     ):
         with session:
-            empty_cache.assert_called_once_with()
-        empty_cache.assert_called_once_with()
+            empty_cache.assert_called_once_with(retain_physical=True)
+        empty_cache.assert_called_once_with(retain_physical=True)
         wait_for_transfers.assert_called_once_with()
         assert session.last_trim_seconds >= 0.0
 
@@ -58,3 +61,28 @@ def test_replay_can_retain_inactive_cache_without_skipping_executor_reset():
             reset.assert_called_once_with()
             assert session.last_trim_seconds == 0.0
         trim.assert_not_called()
+
+
+def test_allocation_dispatch_reclaims_inactive_npu_cache_automatically():
+    session = OffloadSession(OffloadConfig())
+    dispatch_mode = ActivationDispatchMode(session)
+    total_bytes = 64 * 1024**3
+    inactive_bytes = 1024**3
+
+    with patch("mindspeed.core.memory.hyper_offload.api.session.torch.npu", create=True) as npu:
+        npu.is_initialized.return_value = True
+        npu.current_device.return_value = 0
+        npu.get_device_properties.return_value.total_memory = total_bytes
+        npu.memory_stats_as_nested_dict.return_value = {
+            "reserved_bytes": {"all": {"current": total_bytes * 95 // 100}},
+            "allocated_bytes": {"all": {"current": total_bytes * 95 // 100 - inactive_bytes}},
+        }
+        with patch.object(session.executor, "dispatch", return_value="allocation") as dispatch:
+            result = dispatch_mode.__torch_dispatch__(
+                torch.ops.aten.empty.memory_format, (), ([8],), {}
+            )
+
+    assert result == "allocation"
+    dispatch.assert_called_once()
+    npu.empty_virt_addr_cache.assert_called_once_with()
+    npu.empty_cache.assert_not_called()

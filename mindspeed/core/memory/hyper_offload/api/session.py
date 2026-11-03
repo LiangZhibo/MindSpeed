@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import sys
+import threading
 import time
 
 import torch
@@ -33,14 +34,34 @@ from mindspeed.core.memory.hyper_offload.runtime.residency import ResidencyManag
 
 logger = logging.getLogger(__name__)
 
+_CACHE_RECLAIM_RESERVED_NUMERATOR = 935
+_CACHE_RECLAIM_RESERVED_DENOMINATOR = 1000
+_CACHE_RECLAIM_MIN_INACTIVE_BYTES = 512 * 1024**2
+_ALLOCATION_OPS = {
+    torch.ops.aten.empty.memory_format,
+    torch.ops.aten.empty_strided.default,
+    torch.ops.aten.new_empty.default,
+    torch.ops.aten.new_empty_strided.default,
+    torch.ops.aten._to_copy.default,
+}
 
-def _empty_accelerator_cache() -> None:
+
+def _empty_accelerator_cache(*, retain_physical: bool = False) -> bool | None:
     """Release inactive cache through the initialized accelerator backend."""
     for name in ("npu", "cuda"):
         backend = getattr(torch, name, None)
         if backend is not None and backend.is_initialized():
+            if retain_physical and name == "npu":
+                try:
+                    backend.empty_virt_addr_cache()
+                except RuntimeError as error:
+                    if "Unsupported config for empty_virt_addr_cache" not in str(error):
+                        raise
+                else:
+                    return True
             backend.empty_cache()
-            return
+            return False
+    return None
 
 
 def _inside_fsdp_internal() -> bool:
@@ -71,6 +92,7 @@ class ActivationDispatchMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # pylint: disable=unused-argument
         """Dispatch a torch operation."""
+        self.session._reclaim_before_allocation(func)
         if _inside_fsdp_internal():
             with _disable_current_modes():
                 return func(*args, **(kwargs or {}))
@@ -103,6 +125,31 @@ class OffloadSession:
         self._cleanup_failed = False
         self.last_trim_seconds = 0.0
         self.trim_before_replay = config.trim_before_replay
+        self._virtual_cache_supported = None
+        self._cache_reclaim_threshold_bytes = None
+        self._cache_reclaim_lock = threading.Lock()
+
+    def _reclaim_before_allocation(self, func):
+        """Unmap inactive NPU cache before allocator pressure forces retries."""
+        if func not in _ALLOCATION_OPS and str(func) != "fsdp.all_gather_copy_in.default":
+            return
+        backend = getattr(torch, "npu", None)
+        if backend is None or not backend.is_initialized() or self._virtual_cache_supported is False:
+            return
+        with self._cache_reclaim_lock:
+            if self._cache_reclaim_threshold_bytes is None:
+                total_bytes = backend.get_device_properties(backend.current_device()).total_memory
+                self._cache_reclaim_threshold_bytes = (
+                    total_bytes * _CACHE_RECLAIM_RESERVED_NUMERATOR
+                    // _CACHE_RECLAIM_RESERVED_DENOMINATOR
+                )
+            stats = backend.memory_stats_as_nested_dict()
+            reserved = stats["reserved_bytes"]["all"]["current"]
+            allocated = stats["allocated_bytes"]["all"]["current"]
+            if (reserved < self._cache_reclaim_threshold_bytes
+                    or reserved - allocated < _CACHE_RECLAIM_MIN_INACTIVE_BYTES):
+                return
+            self._virtual_cache_supported = _empty_accelerator_cache(retain_physical=True)
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)
@@ -126,7 +173,12 @@ class OffloadSession:
         self.last_trim_seconds = 0.0
         if self.mode == "replay" and self.trim_before_replay:
             trim_started = time.perf_counter()
-            _empty_accelerator_cache()
+            if self._virtual_cache_supported is not False:
+                supported = _empty_accelerator_cache(retain_physical=True)
+                if supported is not None:
+                    self._virtual_cache_supported = supported
+            else:
+                _empty_accelerator_cache()
             self.last_trim_seconds = time.perf_counter() - trim_started
         self.executor.reset()
 
