@@ -21,6 +21,7 @@ import operator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from mindspeed.core.memory.compression.transport import TransferCodec
     from mindspeed.core.memory.hyper_offload.planning.base import ResidencyPlanner
 
 
@@ -33,18 +34,29 @@ class OffloadConfig:
         max_offload_activation_mb:  Maximum pinned host memory for offload buffers, in MiB.
             Defaults to 65536 (64 GiB).
         planner: Optional residency planner implementation.
+        codec: Optional storage transfer codec. None keeps raw transfers.
         trim_before_replay: Release inactive accelerator cache before each replay.
+        record_cache_reclaim: Record allocation-pressure check/reclaim costs for
+            diagnostics. This does not change the reclaim policy.
 
     """
 
     max_resident_activation_mb: int = 1024
     max_offload_activation_mb: int = 65536
     planner: ResidencyPlanner | None = None
+    codec: TransferCodec | None = None
     trim_before_replay: bool = True
+    record_cache_reclaim: bool = False
 
     def __post_init__(self):
+        if self.codec is not None and not all(
+            callable(getattr(self.codec, name, None)) for name in ("accepts", "encode", "decode")
+        ):
+            raise TypeError("codec must provide accepts, encode and decode")
         if not isinstance(self.trim_before_replay, bool):
             raise TypeError('trim_before_replay must be a boolean')
+        if not isinstance(self.record_cache_reclaim, bool):
+            raise TypeError('record_cache_reclaim must be a boolean')
         for name in ("max_resident_activation_mb", "max_offload_activation_mb"):
             value = getattr(self, name)
             if isinstance(value, bool):

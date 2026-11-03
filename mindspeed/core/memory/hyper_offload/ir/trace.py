@@ -20,6 +20,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 import math
 
+from .transfer import validate_transfer_samples
+
 
 class AccessKind(Enum):
     """How an op accesses a storage."""
@@ -56,6 +58,7 @@ class ActivationTrace:
     memory_limit_bytes: int | None = None
     d2h_bandwidth_gbps: float = 16.0
     h2d_bandwidth_gbps: float = 16.0
+    transfer_cost_samples: tuple[tuple[int, float, float], ...] = ()
 
     def validate(self) -> ActivationTrace:
         """Validate metadata and return a dense copy of legacy sparse traces."""
@@ -63,6 +66,7 @@ class ActivationTrace:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"trace {name} must be a nonnegative integer")
 
+        validate_transfer_samples(self.transfer_cost_samples)
         if self.memory_limit_bytes is not None:
             nonnegative_integer(self.memory_limit_bytes, "budget")
         for sid, size in self.storage_sizes.items():

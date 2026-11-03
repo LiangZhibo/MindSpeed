@@ -77,9 +77,9 @@ class ActivationTracker:
                 storage = physical.device_buffer.untyped_storage()
                 # H2D can replace physical storage without changing logical SID.
                 self._storage_tracker[storage] = sid
-                self._storage_sizes[sid] = max(self._storage_sizes.get(sid, 0), storage.nbytes())
+                self._storage_sizes[sid] = max(self._storage_sizes.get(sid, 0), physical.logical_nbytes or storage.nbytes())
             elif physical.host_buffer is not None:
-                self._storage_sizes.setdefault(sid, physical.host_buffer.numel())
+                self._storage_sizes.setdefault(sid, physical.logical_nbytes or physical.host_buffer.numel())
             self._next_storage_id = max(self._next_storage_id, sid + 1)
             return sid
         try:

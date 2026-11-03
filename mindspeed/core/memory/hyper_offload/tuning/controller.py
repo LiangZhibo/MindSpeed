@@ -29,8 +29,17 @@ class JointPolicy:
     trim_before_replay: bool = True
     defer_h2d_release: bool = False
     trim_after_offload: bool = False
+    codec_key: str = "raw"
+    trim_replay_interval: int = 1
 
     def __post_init__(self):
+        if (isinstance(self.trim_replay_interval, bool) or not isinstance(self.trim_replay_interval, int)
+                or self.trim_replay_interval < 1):
+            raise ValueError('trim_replay_interval must be a positive integer')
+        if not self.trim_before_replay and self.trim_replay_interval != 1:
+            raise ValueError('periodic trimming requires trim_before_replay')
+        if not isinstance(self.codec_key, str) or not self.codec_key.strip():
+            raise ValueError("codec_key must be a nonempty immutable transport profile key")
         if not isinstance(self.limit_prefetch_window, bool):
             raise ValueError('limit_prefetch_window must be a boolean')
         if not isinstance(self.prefetch_on_copy_stream, bool):
@@ -101,6 +110,8 @@ class TuningLimits:
     host_peak_bytes: int | None = None
     max_search_seconds: float = 1.0
     minimum_relative_gain: float = 0.005
+    timing_noise_multiplier: float = 0.0
+    validate_confirmation_timing: bool = False
 
     def __post_init__(self):
         for name in ('max_steps', 'max_candidates', 'samples_per_candidate', 'confirmation_steps'):
@@ -113,6 +124,10 @@ class TuningLimits:
             raise ValueError('search time budget must be finite and positive')
         if not math.isfinite(self.minimum_relative_gain) or not 0 <= self.minimum_relative_gain < 1:
             raise ValueError('minimum_relative_gain must be in [0,1)')
+        if not math.isfinite(self.timing_noise_multiplier) or self.timing_noise_multiplier < 0:
+            raise ValueError('timing_noise_multiplier must be finite and nonnegative')
+        if not isinstance(self.validate_confirmation_timing, bool):
+            raise ValueError('validate_confirmation_timing must be a boolean')
         for name in ('device_peak_bytes', 'host_peak_bytes'):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
@@ -136,8 +151,31 @@ class Trial:
     feasible: bool = True
 
     @property
+    def balanced_samples(self) -> list[float]:
+        """One mean per complete execution cycle, including expensive phases.
+
+        Within-cycle trim/no-trim differences are expected work, not timing
+        noise. A single cycle has no observed between-cycle dispersion; this
+        is not a confidence claim and measured tuning still requires a new
+        complete confirmation cycle before accepting a periodic winner.
+        """
+        cycle = self.policy.trim_replay_interval if self.policy.trim_before_replay else 1
+        if cycle == 1:
+            return self.samples
+        if len(self.samples) % cycle:
+            return []  # A cheap partial cycle cannot receive a finite score.
+        return [math.fsum(self.samples[i:i+cycle]) / cycle
+                for i in range(0,len(self.samples),cycle)]
+
+    @property
     def score(self) -> float:
-        return median(self.samples) if self.feasible and self.samples else math.inf
+        values = self.balanced_samples
+        return median(values) if self.feasible and values else math.inf
+
+    @property
+    def spread(self) -> float:
+        score = self.score
+        return median(abs(value-score) for value in self.balanced_samples) if math.isfinite(score) else math.inf
 
 
 class JointTuningController:
@@ -165,8 +203,44 @@ class JointTuningController:
         self.stop_reason: str | None = None
         self.trials: list[Trial] = []
         self.confirmation: list[StepObservation] = []
+        self.confirmation_target = self.limits.confirmation_steps
+        self.confirmation_fallback = False
+        self.confirmation_reference_index = 0
+        self.selection_log: list[dict] = []
         self._trial = Trial(initial)
         self._propose = propose
+        if 1 + self._measurement_steps(initial) + self._confirmation_steps(initial) > self.limits.max_steps:
+            raise ValueError('step budget must cover complete initial execution cycles')
+
+    @staticmethod
+    def _cycle_steps(policy):
+        return policy.trim_replay_interval if policy.trim_before_replay else 1
+
+    def _measurement_steps(self, policy):
+        cycle = self._cycle_steps(policy)
+        return ((self.limits.samples_per_candidate + cycle - 1) // cycle) * cycle
+
+    def _confirmation_steps(self, policy):
+        cycle = self._cycle_steps(policy)
+        return ((self.limits.confirmation_steps + cycle - 1) // cycle) * cycle
+
+    def _search_steps(self, best, candidate=None):
+        candidate = best if candidate is None else candidate
+        periodic = max(self._cycle_steps(best), self._cycle_steps(candidate)) > 1
+        if not periodic:
+            return 1 + self._measurement_steps(candidate) + 1 + self._confirmation_steps(best)
+        # Candidate wins: no restore, but a full periodic confirmation and a
+        # possible fallback. Incumbent wins: restore it and confirm its own
+        # cycle. These branches are mutually exclusive; do not charge both a
+        # periodic winner's confirmation and an unnecessary winner restore.
+        validate = self.limits.validate_confirmation_timing
+        initial = self.trials[0].policy
+        candidate_finish = self._confirmation_steps(candidate) + int(validate and candidate != initial)
+        incumbent_confirmation = self._confirmation_steps(best)
+        if validate and best != initial and self._cycle_steps(best) == 1:
+            incumbent_confirmation = 1  # Existing nonperiodic budget contract.
+        incumbent_finish = 1 + incumbent_confirmation + int(validate and best != initial)
+        return 1 + self._measurement_steps(candidate) + max(candidate_finish, incumbent_finish)
 
     @property
     def stable(self) -> bool:
@@ -198,18 +272,42 @@ class JointTuningController:
             if self.steps > self.limits.max_steps:
                 raise RuntimeError('tuning step budget exhausted without a qualified policy')
             feasible = self._feasible(observation)
-            if self.phase in ('restore', 'confirm'):
+            if self.phase in ('restore', 'confirm', 'fallback'):
                 if not feasible:
                     raise RuntimeError(
                         'selected policy failed confirmation; training must stop or restore a checkpoint'
                     )
-                if self.phase == 'restore':
+                if self.phase == 'fallback':
+                    # This incumbent already has complete warmup and measured
+                    # samples. A full restored step validates capacity before
+                    # the hard deadline; no new search or trace is required.
+                    self.selection_log.append(dict(step=self.steps,phase='fallback_validation',
+                        elapsed_seconds=observation.elapsed_seconds,device_peak_bytes=observation.device_peak_bytes,
+                        host_peak_bytes=observation.host_peak_bytes,accepted=True))
+                    self.phase = 'stable'
+                    self.frozen_at_step = self.steps
+                elif self.phase == 'restore':
                     self.phase = 'confirm'
                 else:
                     self.confirmation.append(observation)
-                    if len(self.confirmation) >= self.limits.confirmation_steps:
-                        self.phase = 'stable'
-                        self.frozen_at_step = self.steps
+                    if len(self.confirmation) >= self.confirmation_target:
+                        baseline = self.trials[self.confirmation_reference_index]
+                        measured = Trial(self.policy, samples=[x.elapsed_seconds for x in self.confirmation])
+                        reject = (self.limits.validate_confirmation_timing and self.policy != baseline.policy
+                                  and not self._beats(measured, baseline))
+                        self.selection_log.append(dict(step=self.steps, phase='confirmation',
+                            samples=list(measured.samples), score=measured.score, spread=measured.spread,
+                            accepted=not reject))
+                        if reject:
+                            if self.steps >= self.limits.max_steps:
+                                raise RuntimeError('no budget remains to validate the timing fallback')
+                            self.policy = baseline.policy
+                            self.confirmation_fallback = True
+                            self.stop_reason = 'confirmation_timing_fallback'
+                            self.phase = 'fallback'
+                        else:
+                            self.phase = 'stable'
+                            self.frozen_at_step = self.steps
                 return self.policy
 
             trial = self._trial
@@ -222,11 +320,22 @@ class JointTuningController:
                 self.phase = 'measure'
             else:
                 trial.samples.append(observation.elapsed_seconds)
-                if len(trial.samples) >= self.limits.samples_per_candidate:
+                if len(trial.samples) >= self._measurement_steps(trial.policy):
                     self._finish_trial()
             return self.policy
         finally:
             self.search_seconds += time.perf_counter() - started
+
+    def _beats(self, challenger: Trial, incumbent: Trial) -> bool:
+        if not math.isfinite(challenger.score):
+            return False
+        if not math.isfinite(incumbent.score):
+            return True
+        margin = incumbent.score * self.limits.minimum_relative_gain
+        margin += self.limits.timing_noise_multiplier * (challenger.spread + incumbent.spread)
+        # This is a bounded screening guard, not a confidence interval from
+        # two samples. Independent stable-step runs establish final speed.
+        return challenger.score < incumbent.score - margin
 
     def _finish_trial(self):
         self.trials.append(self._trial)
@@ -235,14 +344,16 @@ class JointTuningController:
         # replace it. This is a configurable decision margin, not a statistical
         # confidence claim, and requires no extra tuning iterations.
         best = self.trials[0]
-        for trial in self.trials[1:]:
-            if trial.score < best.score * (1 - self.limits.minimum_relative_gain):
+        best_index, prior_best_index = 0, 0
+        for index, trial in enumerate(self.trials[1:], 1):
+            if self._beats(trial, best):
+                prior_best_index, best_index = best_index, index
                 best = trial
         if not math.isfinite(best.score):
             raise RuntimeError('no measured policy satisfies the memory and validity constraints')
         # Reserve one candidate warmup, its samples, a possible return-to-best
         # settling iteration and final confirmation before requesting any work.
-        needed = 1 + self.limits.samples_per_candidate + 1 + self.limits.confirmation_steps
+        needed = self._search_steps(best.policy)
         can_search = (
             self.steps + needed <= self.limits.max_steps
             and len(self.trials) < self.limits.max_candidates
@@ -261,11 +372,35 @@ class JointTuningController:
             if candidate is not None and any(candidate == trial.policy for trial in self.trials):
                 candidate = None
                 self.stop_reason = 'duplicate_proposal'
+            if candidate is not None and self.steps + self._search_steps(best.policy, candidate) > self.limits.max_steps:
+                candidate = None
+                self.stop_reason = 'periodic_cycle_budget'
         if candidate is not None:
             self.policy = candidate
             self._trial = Trial(candidate)
             self.phase = 'warmup'
             return
         self.stop_reason = self.stop_reason or ('proposal_exhausted' if can_search else 'tuning_budget')
-        self.phase = 'confirm' if self.policy == best.policy else 'restore'
+        self.confirmation_reference_index = prior_best_index if self._cycle_steps(best.policy) > 1 else 0
+        restoring = self.policy != best.policy
+        self.phase = 'restore' if restoring else 'confirm'
         self.policy = best.policy
+        self.confirmation_target = self._confirmation_steps(best.policy)
+        if self.limits.validate_confirmation_timing and best.policy != self.trials[0].policy:
+            # Reserve one complete restore/validation step for the already
+            # measured initial policy if independent confirmation loses its
+            # gain. Returning to an earlier candidate may leave one confirm
+            # sample at the 12-step cap; record the actual target explicitly.
+            available = self.limits.max_steps - self.steps - int(restoring) - 1
+            if self._cycle_steps(best.policy) > 1 and available < self.confirmation_target:
+                raise RuntimeError('step budget cannot confirm a complete periodic execution cycle')
+            self.confirmation_target = min(self.confirmation_target, available)
+            if self.confirmation_target < 1:
+                raise RuntimeError('step budget cannot confirm the selected policy')
+        self.selection_log.append(dict(step=self.steps, phase='selection',
+            selected_index=next(i for i,t in enumerate(self.trials) if t is best),
+            scores=[t.score if math.isfinite(t.score) else None for t in self.trials],
+            spreads=[t.spread if math.isfinite(t.spread) else None for t in self.trials],
+            confirmation_target=self.confirmation_target,
+            confirmation_cycle_steps=self._cycle_steps(best.policy),
+            confirmation_reference_index=self.confirmation_reference_index))

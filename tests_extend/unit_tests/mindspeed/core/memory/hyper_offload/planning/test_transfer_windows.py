@@ -74,3 +74,20 @@ class TestTransferWindows(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_measured_packet_latency_changes_window_without_relaxing_capacity():
+    case=TestTransferWindows()
+    original=case.context(1)
+    calibrated=replace(case.context(1),transfer_cost_samples=((1024**2,.5,8.),))
+    base,_=apply_communication_masking(original)
+    schedule,resident=apply_communication_masking(calibrated)
+    assert case.positions(schedule,Action.COPY_H2D)<case.positions(base,Action.COPY_H2D)
+    assert max(resident)<=calibrated.limit
+    constrained=case.context(1)
+    constrained.resident_bytes[1]=constrained.limit
+    constrained.resident_bytes[9]=constrained.limit
+    constrained=replace(constrained,transfer_cost_samples=((1024**2,.5,8.),))
+    schedule,resident=apply_communication_masking(constrained)
+    assert case.positions(schedule,Action.COPY_H2D)==[10]
+    assert max(resident)<=constrained.limit

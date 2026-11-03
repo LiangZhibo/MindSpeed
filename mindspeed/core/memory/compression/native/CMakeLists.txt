@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.16)
+project(MindSpeedSplitZip LANGUAGES CXX)
+set(SOC_VERSION "Ascend910B3" CACHE STRING "Validated device")
+if(NOT SOC_VERSION STREQUAL "Ascend910B3")
+  message(FATAL_ERROR "The supplied kernel is validated only on Ascend910B3")
+endif()
+set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}")
+set(RUN_MODE "npu")
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+find_file(ASCENDC_CMAKE ascendc.cmake PATHS
+  "${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake"
+  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/tikcpp/ascendc_kernel_cmake" NO_DEFAULT_PATH REQUIRED)
+include(${ASCENDC_CMAKE})
+ascendc_library(splitzip_kernel STATIC vendor/splitzip.cpp)

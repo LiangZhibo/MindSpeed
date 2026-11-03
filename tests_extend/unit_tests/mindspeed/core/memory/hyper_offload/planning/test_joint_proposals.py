@@ -3,7 +3,6 @@ from mindspeed.core.memory.hyper_offload.tuning.proposals import JointNeighborho
 
 
 def test_named_region_moves_refine_or_restore_from_measured_cost():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33)))
     proposer = QwenRegionNeighborhood(48, 33, probe='mlp')
     first = Trial(initial, samples=[12, 12])
@@ -18,7 +17,6 @@ def test_named_region_moves_refine_or_restore_from_measured_cost():
 
 
 def test_cheap_regions_compare_both_masking_choices_without_another_trace():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33)))
     proposer = QwenRegionNeighborhood(48, 33)
     first = Trial(initial, samples=[12, 12])
@@ -43,7 +41,6 @@ def test_joint_neighborhood_advances_using_actual_step_cost():
 
 
 def test_residency_probe_only_keeps_attention_in_the_offloaded_suffix():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='attention_resident')
     norm = propose((initial,))
@@ -56,7 +53,6 @@ def test_residency_probe_only_keeps_attention_in_the_offloaded_suffix():
 
 
 def test_suffix_residency_probe_adds_only_gate_operator_groups():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='suffix_resident')
     attention = propose((initial,))
@@ -68,7 +64,6 @@ def test_suffix_residency_probe_adds_only_gate_operator_groups():
 
 
 def test_mlp_residency_probe_refines_individual_subregions_without_overlap():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='mlp_resident')
     gate = propose((initial,))
@@ -81,7 +76,6 @@ def test_mlp_residency_probe_refines_individual_subregions_without_overlap():
 
 
 def test_compute_probe_keeps_attention_instead_of_offloading_its_saves():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='compute_resident')
     mlp = propose((initial,))
@@ -94,7 +88,6 @@ def test_compute_probe_keeps_attention_instead_of_offloading_its_saves():
 
 
 def test_budget_probe_reuses_structure_and_only_reduces_managed_residency():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='budget_resident')
     fine = propose((initial,))
@@ -114,7 +107,6 @@ def test_joint_neighborhood_reverses_direction_after_regression():
 
 
 def test_stream_probe_changes_execution_without_invalidating_structure():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='stream_resident')
     fine = propose((initial,))
@@ -126,7 +118,6 @@ def test_stream_probe_changes_execution_without_invalidating_structure():
 
 
 def test_cache_probe_keeps_region_and_memory_constraints_fixed():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='cache_resident')
     fine = propose((initial,))
@@ -139,7 +130,6 @@ def test_cache_probe_keeps_region_and_memory_constraints_fixed():
 
 
 def test_pointwise_probe_adds_only_cheap_mlp_checkpoint_group():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='pointwise_resident')
     fine = propose((initial,))
@@ -153,7 +143,6 @@ def test_pointwise_probe_adds_only_cheap_mlp_checkpoint_group():
 
 
 def test_gate_checkpoint_probe_recomputes_projection_without_limiting_prefetch():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='gate_recompute_resident')
     fine = propose((initial,))
@@ -167,7 +156,6 @@ def test_gate_checkpoint_probe_recomputes_projection_without_limiting_prefetch()
 
 
 def test_placement_probe_preserves_region_counts_and_moves_offload_to_early_forward():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='placement_resident')
     fine = propose((initial,))
@@ -182,7 +170,6 @@ def test_placement_probe_preserves_region_counts_and_moves_offload_to_early_forw
 
 
 def test_window_probe_reuses_trace_and_budget_with_bounded_lookahead():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='window_resident')
     fine = propose((initial,))
@@ -195,7 +182,6 @@ def test_window_probe_reuses_trace_and_budget_with_bounded_lookahead():
 
 
 def test_release_probe_changes_only_allocator_release_wait_policy():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='release_resident')
     fine = propose((initial,))
@@ -210,7 +196,6 @@ def test_release_probe_changes_only_allocator_release_wait_policy():
 
 def test_configured_window_probe_preserves_control_and_deduplicates_same_schedule():
     from dataclasses import replace
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     control = QwenRegionNeighborhood(48, 33, probe='window_resident')((initial,))
     for multiplier, bounded in ((4, True), (16, True), (8, False)):
@@ -228,7 +213,6 @@ def test_configured_window_probe_preserves_control_and_deduplicates_same_schedul
 
 def test_window_probe_rejects_invalid_timing_controls():
     import unittest
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     check = unittest.TestCase()
     for multiplier in (-1, float('inf'), float('nan')):
         with check.assertRaisesRegex(ValueError, 'window_probe_multiplier'):
@@ -240,7 +224,6 @@ def test_window_probe_rejects_invalid_timing_controls():
 def test_phase_trim_probe_keeps_fine_window_control_and_changes_only_cleanup():
     from dataclasses import replace
     import unittest
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='phase_trim_resident')
     fine = propose((initial,))
@@ -255,7 +238,6 @@ def test_phase_trim_probe_keeps_fine_window_control_and_changes_only_cleanup():
 
 def test_pointwise_window_probe_changes_only_pointwise_regions_at_the_same_finite_window():
     from dataclasses import replace
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='pointwise_window_resident')
     fine = propose((initial,))
@@ -270,7 +252,6 @@ def test_pointwise_window_probe_changes_only_pointwise_regions_at_the_same_finit
 
 def test_phase_cache_probe_compares_cleanup_placement_with_the_same_regions_and_window():
     from dataclasses import replace
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='phase_cache_resident')
     both = propose((initial,))
@@ -284,7 +265,6 @@ def test_phase_cache_probe_compares_cleanup_placement_with_the_same_regions_and_
 
 
 def test_partial_compute_probe_keeps_mlp_checkpoints_and_changes_only_bounded_attention_group():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='partial_compute_resident')
     fine = propose((initial,))
@@ -300,7 +280,6 @@ def test_partial_compute_probe_keeps_mlp_checkpoints_and_changes_only_bounded_at
 
 
 def test_gate_compute_probe_directly_qualifies_prefix_operator_group_tradeoff():
-    from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
     initial = Trial(JointPolicy(0, 2048, recompute_regions=tuple(str(i) for i in range(33))), [12, 12])
     propose = QwenRegionNeighborhood(48, 33, probe='gate_compute_resident')
     fine = propose((initial,))
@@ -313,3 +292,18 @@ def test_gate_compute_probe_directly_qualifies_prefix_operator_group_tradeoff():
     assert gate.resident_mb == fine.resident_mb and not gate.defer_h2d_release
     assert not gate.limit_prefetch_window and gate.transfer_window_scale == fine.transfer_window_scale
     assert propose((initial, Trial(fine), Trial(gate))) is None
+
+
+def _load_legacy_qwen_candidate():
+    # Megatron also exports an examples package; load the local fixture by path.
+    import importlib.util
+    from pathlib import Path
+    relative = 'examples/qwen25_32b_fsdp2_a2/native_fsdp2/legacy_tuning.py'
+    root = next(p for p in Path(__file__).resolve().parents if (p / relative).is_file())
+    spec = importlib.util.spec_from_file_location('hyperoffload_legacy_qwen_fixture', root / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.QwenRegionNeighborhood
+
+
+QwenRegionNeighborhood = _load_legacy_qwen_candidate()

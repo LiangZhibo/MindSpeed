@@ -16,8 +16,7 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 from torch.distributed.tensor import DTensor
-from transformers import AutoModelForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from qwen_chunk_loss import calculate_lm_loss, chunk_loss
 from mindspeed.core.memory.hyper_offload import OffloadConfig, OffloadSession, skip_offload
@@ -75,8 +74,8 @@ class ChunkedHead(torch.nn.Module):
 class TrainingModel(torch.nn.Module):
     def __init__(self, hf_model, chunk_size):
         super().__init__()
-        self.model = hf_model.model
-        self.lm_head = ChunkedHead(hf_model.lm_head, chunk_size)
+        self.model = getattr(hf_model, hf_model.base_model_prefix)
+        self.lm_head = ChunkedHead(hf_model.get_output_embeddings(), chunk_size)
 
     def forward(self, input_ids, labels):
         hidden = self.model(input_ids=input_ids, use_cache=False).last_hidden_state
@@ -86,6 +85,9 @@ class TrainingModel(torch.nn.Module):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--model-config", help="Local random-weight HF config for architecture qualification")
+    parser.add_argument("--model-init-seed", type=int, default=1234)
+    parser.add_argument("--offload-region-layout", choices=("legacy_qwen", "gated", "parallel_mlp"), default="gated")
     parser.add_argument("--seq-length", type=int, default=4096)
     parser.add_argument("--layers", type=int, default=48)
     parser.add_argument("--loss-chunk", type=int, default=128)
@@ -99,6 +101,11 @@ def parse_args():
     parser.add_argument("--offload-planner", choices=("peak", "greedy"), default="peak")
     parser.add_argument("--offload-communication-masking", action="store_true")
     parser.add_argument("--hyper-offload-autotune", action="store_true")
+    parser.add_argument("--offload-tuning-method", choices=("legacy", "measured"), default="measured")
+    parser.add_argument("--offload-transfer-size-calibration", action="store_true",
+                        help="Calibrate observed transfer sizes during bounded warmup")
+    parser.add_argument("--offload-joint-refinement", action="store_true",
+                        help="Test a joint region/cadence refinement in the second candidate slot")
     parser.add_argument("--offload-tuning-steps", type=int, default=10)
     parser.add_argument("--offload-tuning-candidates", type=int, default=3)
     parser.add_argument("--offload-window-probe-multiplier", type=float, default=8.0)
@@ -141,25 +148,35 @@ def log(rank, message):
 
 
 def crop_layers(model, layers):
-    source_layers = len(model.model.layers)
+    base = getattr(model, model.base_model_prefix)
+    source_layers = len(base.layers)
     if layers < 1 or layers > source_layers:
         raise ValueError(f"--layers must be in [1, {source_layers}], got {layers}")
     if layers < source_layers:
-        model.model.layers = torch.nn.ModuleList(list(model.model.layers[:layers]))
+        base.layers = torch.nn.ModuleList(list(base.layers[:layers]))
         model.config.num_hidden_layers = layers
-        model.model.config.num_hidden_layers = layers
+        base.config.num_hidden_layers = layers
     return model
 
 
 def make_engine(args, rank):
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        dtype=torch.bfloat16,
-        device_map={"": "cpu"},
-        low_cpu_mem_usage=True,
-        local_files_only=True,
-        attn_implementation="sdpa",
-    )
+    if args.model_config:
+        config_values = json.loads(Path(args.model_config).read_text())
+        model_type = config_values.pop('model_type')
+        config = AutoConfig.for_model(model_type, **config_values)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(args.model_init_seed)
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16,
+                                                    attn_implementation='sdpa')
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            dtype=torch.bfloat16,
+            device_map={"": "cpu"},
+            low_cpu_mem_usage=True,
+            local_files_only=True,
+            attn_implementation="sdpa",
+        )
     crop_layers(model, args.layers)
     model.config.use_cache = False
     recompute_layers = args.recompute_layers
@@ -182,7 +199,7 @@ def make_engine(args, rank):
         transformer_config,
         ddp_config,
         training_model,
-        sub_modules_to_wrap={Qwen2DecoderLayer, torch.nn.Embedding, ChunkedHead},
+        sub_modules_to_wrap={type(training_model.model.layers[0]), torch.nn.Embedding, ChunkedHead},
         process_group=dist.group.WORLD,
     )
     if recompute_layers and not args.hyper_offload_autotune:
@@ -199,9 +216,12 @@ def make_engine(args, rank):
         for layer in engine.module.model.layers[:recompute_layers]:
             layer.forward = skip_offload(layer.forward)
     if args.hyper_offload_autotune:
-        from mindspeed.core.memory.hyper_offload.tuning.regions import qwen_recompute_regions
+        from mindspeed.core.memory.hyper_offload.tuning.regions import qwen_recompute_regions, decoder_recompute_regions
 
-        engine._hyper_offload_regions = qwen_recompute_regions(engine.module.model.layers)
+        engine._hyper_offload_regions = (
+            qwen_recompute_regions(engine.module.model.layers) if args.offload_region_layout == 'legacy_qwen'
+            else decoder_recompute_regions(engine.module.model.layers, layout=args.offload_region_layout)
+        )
     log(
         rank,
         "ENGINE_READY "
@@ -263,7 +283,7 @@ def main():
         raise ValueError("joint tuning requires --hyper-offload")
     if (
         args.hyper_offload_autotune
-        and args.offload_tuning_probe.endswith('_resident')
+        and (args.offload_tuning_method == 'measured' or args.offload_tuning_probe.endswith('_resident'))
         and args.offload_tuning_device_peak_mb is None
     ):
         raise ValueError('resident-region tuning requires an explicit whole-device peak limit')
@@ -282,7 +302,9 @@ def main():
     engine, vocab_size, parameter_count = make_engine(args, rank)
     engine.train()
     optimizer = torch.optim.SGD(engine.parameters(), lr=1.0e-2)
-    probe_parameter = engine.module.model.layers[0].mlp.down_proj.weight
+    first_mlp = engine.module.model.layers[0].mlp
+    probe_parameter = (first_mlp.down_proj.weight if hasattr(first_mlp, 'down_proj')
+                       else next(p for p in first_mlp.parameters() if p.requires_grad and p.ndim == 2))
     probe_local = probe_parameter.to_local() if isinstance(probe_parameter, DTensor) else probe_parameter
     probe_before = probe_local.detach().reshape(-1)[:4096].clone()
     input_ids = torch.randint(vocab_size, (1, args.seq_length), device="npu")
@@ -290,46 +312,39 @@ def main():
     torch.npu.synchronize()
     torch.npu.reset_peak_memory_stats()
     profiler = make_profile(args)
+    session_setup_started = time.perf_counter()
     session = None
     offload_stats = {"d2h_calls": 0, "d2h_gib": 0.0}
     if args.hyper_offload:
         if args.hyper_offload_autotune:
             from mindspeed.core.memory.hyper_offload.tuning import JointPolicy, JointTuningController, TuningLimits
-            from mindspeed.core.memory.hyper_offload.tuning.proposals import QwenRegionNeighborhood
+            from legacy_tuning import QwenRegionNeighborhood
             from mindspeed.core.memory.hyper_offload.tuning.session import JointOffloadSession
 
             count = (
                 args.recompute_layers if args.recompute_layers is not None else (args.layers if args.recompute else 0)
             )
-            controller = JointTuningController(
-                JointPolicy(
-                    0,
-                    args.offload_device_mb,
-                    args.offload_communication_masking,
-                    recompute_regions=tuple(str(i) for i in range(count)),
-                ),
-                QwenRegionNeighborhood(
-                    args.layers,
-                    count,
-                    probe=args.offload_tuning_probe,
+            initial = JointPolicy(0,args.offload_device_mb,args.offload_communication_masking,
+                                  recompute_regions=tuple(str(i) for i in range(count)))
+            limits = TuningLimits(max_steps=args.offload_tuning_steps,max_candidates=args.offload_tuning_candidates,
+                device_peak_bytes=None if args.offload_tuning_device_peak_mb is None else args.offload_tuning_device_peak_mb * 1024**2,
+                host_peak_bytes=args.offload_host_mb * 1024**2)
+            if args.offload_tuning_method == 'measured':
+                if args.offload_region_layout == 'legacy_qwen':
+                    raise ValueError('measured tuning requires an explicit gated or parallel_mlp structural adapter')
+                from mindspeed.core.memory.hyper_offload.tuning.measured_session import MeasuredOffloadSession
+                session = MeasuredOffloadSession(initial,model=engine,regions=engine._hyper_offload_regions,
+                                                limits=limits,host_mb=args.offload_host_mb,
+                                                transfer_size_calibration=args.offload_transfer_size_calibration,
+                                                joint_refinement=args.offload_joint_refinement)
+            else:
+                controller = JointTuningController(initial,QwenRegionNeighborhood(
+                    args.layers,count,probe=args.offload_tuning_probe,
                     resident_mlp_fraction=args.offload_resident_mlp_fraction,
                     window_probe_multiplier=args.offload_window_probe_multiplier,
-                    window_probe_limit_prefetch=not args.offload_window_probe_unlimited_prefetch,
-                ),
-                TuningLimits(
-                    max_steps=args.offload_tuning_steps,
-                    max_candidates=args.offload_tuning_candidates,
-                    device_peak_bytes=(
-                        None
-                        if args.offload_tuning_device_peak_mb is None
-                        else args.offload_tuning_device_peak_mb * 1024**2
-                    ),
-                    host_peak_bytes=args.offload_host_mb * 1024**2,
-                ),
-            )
-            session = JointOffloadSession(
-                controller, apply_policy=engine._hyper_offload_regions.apply_policy, host_mb=args.offload_host_mb
-            )
+                    window_probe_limit_prefetch=not args.offload_window_probe_unlimited_prefetch),limits)
+                session = JointOffloadSession(controller,apply_policy=engine._hyper_offload_regions.apply_policy,
+                                              host_mb=args.offload_host_mb)
         else:
             session = OffloadSession(
                 OffloadConfig(
@@ -353,9 +368,12 @@ def main():
 
         manager.copy_d2h = counted_copy_d2h
     started = time.perf_counter()
+    session_setup_seconds = started - session_setup_started
     result = {
         "rank": rank,
         "world_size": 2,
+        "session_setup_seconds": session_setup_seconds,
+        "timing_boundary": "after shared model/data initialization; session setup reported separately",
         "parameter_count": parameter_count,
         "layers": args.layers,
         "seq_length": args.seq_length,
@@ -392,12 +410,16 @@ def main():
         temporary_path.write_text(json.dumps(snapshot, indent=2))
         temporary_path.replace(result_path)
 
+    observation_and_consensus_seconds = 0.0
+
     def observe_tuning(elapsed, peak_bytes):
+        nonlocal observation_and_consensus_seconds
         if not args.hyper_offload_autotune or session.stable:
             return
+        observation_started = time.perf_counter()
         from dataclasses import asdict
         from mindspeed.core.memory.hyper_offload.tuning import StepObservation
-        from mindspeed.core.memory.hyper_offload.tuning.consensus import policy_fingerprint
+        from mindspeed.core.memory.hyper_offload.tuning.consensus import decision_fingerprint
 
         # Outside the measured interval; one consistent policy on every rank.
         seconds = torch.tensor(elapsed, dtype=torch.float32, device='npu')
@@ -411,9 +433,8 @@ def main():
         peak, host = memory.cpu().tolist()
         session.observe(StepObservation(seconds.cpu().item(), peak, host))
         policy = session.controller.policy
-        phases = ('warmup', 'measure', 'restore', 'confirm', 'stable')
         decision = torch.tensor(
-            [session.controller.steps, phases.index(session.controller.phase), *policy_fingerprint(policy)],
+            decision_fingerprint(session.controller),
             dtype=torch.int64,
             device='npu',
         )
@@ -422,12 +443,31 @@ def main():
         dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
         if not torch.equal(minimum, maximum):
             raise RuntimeError('joint tuning decisions diverged across ranks; refusing a mismatched schedule')
+        observation_and_consensus_seconds += time.perf_counter() - observation_started
         result['joint_tuning'] = dict(
+            observation_and_consensus_seconds=observation_and_consensus_seconds,
+            switch_seconds=session.switch_seconds,
+            timing_events=session.timing_events,
+            timing_event_count=len(session.timing_events),
+            cache_reclaim_stats=dict(session.cache_reclaim_stats),
+            cache_reclaim_observation_enabled=session.record_cache_reclaim,
+            proposal_compute_seconds=getattr(session,'proposal_compute_seconds',None),
+            proposal_consensus_seconds=getattr(session,'proposal_consensus_seconds',None),
+            phase_sample_count=len((getattr(session,'phase_report',None) or {}).get('samples',())),
+            region_observation_count=len((getattr(session,'region_report',None) or {}).get('regions',())),
+            switch_drain_seconds=session.switch_drain_seconds,
+            apply_regions_seconds=session.apply_regions_seconds,
+            codec_prepare_seconds=session.codec_prepare_seconds,
+            warmup_context_seconds=session.warmup_context_seconds,
+            warmup_finish_seconds=session.warmup_finish_seconds,
             phase=session.controller.phase,
             steps=session.controller.steps,
             frozen_at_step=session.controller.frozen_at_step,
             policy=asdict(session.controller.policy),
             search_seconds=session.controller.search_seconds,
+            confirmation_target=session.controller.confirmation_target,
+            confirmation_fallback=session.controller.confirmation_fallback,
+            selection_log=session.controller.selection_log,
             plan_seconds=session.plan_seconds,
             plan_builds=session.plan_builds,
             trace_collections=session.trace_collections,
@@ -517,6 +557,7 @@ def main():
 
                 step_result['joint_policy'] = asdict(session.executed_policy)
                 step_result['tuning_phase'] = session.controller.phase
+                step_result['entry_trim_performed'] = session.last_entry_trim_performed
                 step_result['post_offload_trim_calls'] = session.post_offload_trim_calls
                 step_result['post_offload_trim_seconds'] = session.post_offload_trim_seconds
             result["extra_step_results"].append(step_result)
@@ -529,6 +570,7 @@ def main():
             # forward so they cannot pin allocations across iterations.
             del step_loss, step_grad, step_grad_local
             observe_tuning(step_result['elapsed_seconds'], torch.npu.max_memory_allocated())
+            step_result['cumulative_step_wall_seconds'] = time.perf_counter() - started
             write_progress()
         if args.extra_steps:
             result["status"] = "steps_complete"

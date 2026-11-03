@@ -130,3 +130,215 @@ class TestJointController(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def guarded(policies, max_steps=12):
+    return JointTuningController(policies[0],lambda trials: policies[len(trials)] if len(trials)<len(policies) else None,
+        TuningLimits(max_steps=max_steps,timing_noise_multiplier=1.0,validate_confirmation_timing=True))
+
+
+def observe_costs(tuner, values):
+    for value in values:
+        tuner.observe(StepObservation(value,100,200))
+
+
+def test_noise_guard_does_not_promote_an_overlapping_two_sample_gain():
+    initial,candidate=JointPolicy(2,8),JointPolicy(1,8)
+    tuner=guarded([initial,candidate],max_steps=10)
+    observe_costs(tuner,[99,10,10,99,8,11,10,10,10])
+    assert tuner.stable and tuner.policy==initial and tuner.frozen_at_step==9
+    assert tuner.trials[1].score==9.5 and tuner.trials[1].spread==1.5
+
+
+def test_independent_confirmation_can_restore_initial_within_ten_steps():
+    initial,candidate=JointPolicy(2,8),JointPolicy(1,8)
+    tuner=guarded([initial,candidate],max_steps=10)
+    observe_costs(tuner,[99,10,10,99,8,8,11,11])
+    assert tuner.phase=='fallback' and tuner.policy==initial
+    observe_costs(tuner,[10])
+    assert tuner.stable and tuner.frozen_at_step==9 and tuner.confirmation_fallback
+    assert tuner.stop_reason=='confirmation_timing_fallback'
+    assert tuner.selection_log[-1]['phase']=='fallback_validation'
+    counters=(tuner.steps,tuner.search_seconds,len(tuner.selection_log))
+    observe_costs(tuner,[100]*30)
+    assert counters==(tuner.steps,tuner.search_seconds,len(tuner.selection_log))
+
+
+def test_three_candidates_reserve_last_step_for_verified_timing_fallback():
+    policies=[JointPolicy(i,8) for i in (3,2,1)]
+    tuner=guarded(policies)
+    observe_costs(tuner,[99,10,10,99,9,9,99,8,8,11,11,10])
+    assert tuner.stable and tuner.frozen_at_step==12
+    assert tuner.policy==policies[0] and tuner.confirmation_fallback
+    assert len(tuner.trials)==3
+
+
+def test_return_to_earlier_winner_has_explicit_one_step_confirmation_at_cap():
+    policies=[JointPolicy(i,8) for i in (3,2,1)]
+    tuner=guarded(policies)
+    observe_costs(tuner,[99,10,10,99,8,8,99,9,9])
+    assert tuner.phase=='restore' and tuner.policy==policies[1]
+    assert tuner.confirmation_target==1
+    observe_costs(tuner,[8,11,10])
+    assert tuner.stable and tuner.frozen_at_step==12 and tuner.policy==policies[0]
+
+
+def test_confirmed_gain_freezes_and_failed_fallback_capacity_never_does():
+    initial,candidate=JointPolicy(2,8),JointPolicy(1,8)
+    tuner=guarded([initial,candidate],max_steps=10)
+    observe_costs(tuner,[99,10,10,99,8,8,8,8])
+    assert tuner.stable and tuner.frozen_at_step==8 and tuner.policy==candidate
+    tuner=guarded([initial,candidate],max_steps=10)
+    observe_costs(tuner,[99,10,10,99,8,8,11,11])
+    import pytest
+    with pytest.raises(RuntimeError,match='failed confirmation'):
+        tuner.observe(StepObservation(10,100,200,valid=False))
+    assert not tuner.stable
+
+
+def test_noise_and_confirmation_options_are_validated():
+    import pytest
+    for value in (-1,float('nan'),float('inf')):
+        with pytest.raises(ValueError,match='timing_noise_multiplier'):
+            TuningLimits(timing_noise_multiplier=value)
+    with pytest.raises(ValueError,match='validate_confirmation_timing'):
+        TuningLimits(validate_confirmation_timing='yes')
+
+
+def test_periodic_winner_reserves_complete_confirmation_cycle_and_rollback():
+    from dataclasses import replace
+    initial=JointPolicy(3,8)
+    periodic=replace(initial,recompute_count=2,trim_replay_interval=2)
+    further=replace(periodic,recompute_count=1)
+    tuner=guarded([initial,periodic,further])
+    observe_costs(tuner,[99,10,10,99,7,8])
+    assert tuner.policy==periodic and tuner.phase=='confirm'
+    assert len(tuner.trials)==2 and tuner.confirmation_target==2
+    observe_costs(tuner,[7])
+    assert not tuner.stable  # A cheap half-cycle cannot be accepted alone.
+    observe_costs(tuner,[14])  # Complete-cycle mean10.5 is slower than initial10.
+    assert tuner.phase=='fallback' and tuner.policy==initial
+    observe_costs(tuner,[10])
+    assert tuner.stable and tuner.frozen_at_step==9 and tuner.confirmation_fallback
+
+
+def test_late_periodic_candidate_is_rejected_before_execution_if_cycle_cannot_fit():
+    from dataclasses import replace
+    initial=JointPolicy(3,8);first=JointPolicy(2,8)
+    periodic=replace(first,recompute_count=1,trim_replay_interval=2)
+    tuner=guarded([initial,first,periodic],max_steps=11)
+    observe_costs(tuner,[99,10,10,99,8,8])
+    assert tuner.policy==first and tuner.phase=='confirm' and len(tuner.trials)==2
+    assert tuner.stop_reason in ('periodic_cycle_budget','tuning_budget')
+    observe_costs(tuner,[8,8])
+    assert tuner.stable and tuner.frozen_at_step==8
+
+
+def test_periodic_measurement_and_confirmation_round_up_to_whole_cycles():
+    initial=JointPolicy(0,8,trim_replay_interval=2)
+    tuner=JointTuningController(initial,lambda _:None,
+        TuningLimits(max_steps=12,samples_per_candidate=3,confirmation_steps=3))
+    observe_costs(tuner,[99,1,3,1])
+    assert not tuner.trials
+    observe_costs(tuner,[3])
+    assert tuner.trials[0].samples==[1,3,1,3] and tuner.confirmation_target==4
+    observe_costs(tuner,[1,3,1])
+    assert not tuner.stable
+    observe_costs(tuner,[3])
+    assert tuner.stable and tuner.frozen_at_step==9
+
+
+def test_initial_periodic_policy_must_fit_complete_cycles():
+    import pytest
+    with pytest.raises(ValueError,match='complete initial execution cycles'):
+        JointTuningController(JointPolicy(0,8,trim_replay_interval=6),lambda _:None,
+                              TuningLimits(max_steps=12))
+
+
+def test_same_cut_cadence_cannot_hide_behind_initial_recompute_gain():
+    from dataclasses import replace
+    initial,cut=JointPolicy(3,8),JointPolicy(2,8)
+    cadence=replace(cut,trim_replay_interval=2)
+    tuner=guarded([initial,cut,cadence])
+    observe_costs(tuner,[99,12,12,99,10,10,99,11,11])
+    assert tuner.policy==cut and tuner.phase=='restore' and len(tuner.trials)==3
+    observe_costs(tuner,[10,10])
+    assert tuner.stable and tuner.policy==cut and tuner.frozen_at_step==11
+
+
+def test_periodic_confirmation_compares_and_returns_to_improved_cut():
+    from dataclasses import replace
+    initial,cut=JointPolicy(3,8),JointPolicy(2,8)
+    cadence=replace(cut,trim_replay_interval=2)
+    tuner=guarded([initial,cut,cadence])
+    observe_costs(tuner,[99,12,12,99,10,10,99,8,8])
+    assert tuner.phase=='confirm' and tuner.confirmation_reference_index==1
+    observe_costs(tuner,[11])
+    assert not tuner.stable
+    observe_costs(tuner,[11])
+    assert tuner.phase=='fallback' and tuner.policy==cut  # Still faster than initial12.
+    observe_costs(tuner,[10])
+    assert tuner.stable and tuner.policy==cut and tuner.frozen_at_step==12
+
+
+def test_same_cut_periodic_gain_keeps_full_confirmation_and_freezes_at_eleven():
+    from dataclasses import replace
+    initial,cut=JointPolicy(3,8),JointPolicy(2,8)
+    cadence=replace(cut,trim_replay_interval=2)
+    tuner=guarded([initial,cut,cadence])
+    observe_costs(tuner,[99,12,12,99,10,10,99,8,8,8,8])
+    assert tuner.stable and tuner.policy==cadence and tuner.frozen_at_step==11
+    assert len(tuner.confirmation)==2 and not tuner.confirmation_fallback
+
+
+def test_periodic_search_budget_covers_winner_restore_and_fallback_branches():
+    from dataclasses import replace
+    from itertools import product
+    for budget,cycle,candidate_cost,confirmation_cost in product((8,9,10,11,12),(1,2,3,4),(6.,9.),(6.,13.)):
+        initial,cut=JointPolicy(3,8),JointPolicy(2,8)
+        cadence=replace(cut,recompute_count=1,trim_replay_interval=cycle)
+        tuner=guarded([initial,cut,cadence],max_steps=budget)
+        while not tuner.stable:
+            policy=tuner.policy
+            cost=12. if policy==initial else 8. if policy==cut else candidate_cost
+            if tuner.phase=='confirm' and policy!=initial:cost=confirmation_cost
+            tuner.observe(StepObservation(cost,100,200))
+            assert tuner.steps<=budget
+        assert tuner.frozen_at_step<=budget
+        if tuner.policy.trim_replay_interval>1:
+            assert len(tuner.confirmation)%tuner.policy.trim_replay_interval==0
+
+
+def test_periodic_phase_difference_is_not_between_cycle_noise():
+    from mindspeed.core.memory.hyper_offload.tuning.controller import Trial
+    trial=Trial(JointPolicy(0,8,trim_replay_interval=2),samples=[2.,12.,4.,14.])
+    assert trial.balanced_samples==[7.,9.]
+    assert trial.score==8. and trial.spread==1.
+    trial.samples=[2.,12.,4.]
+    assert trial.score==float('inf') and trial.spread==float('inf')
+    triple=Trial(JointPolicy(0,8,trim_replay_interval=3),samples=[1.,1.,31.])
+    assert triple.score==11.  # Median cheap phases must not hide the costly phase.
+
+
+def test_alternating_periodic_gain_requires_and_passes_new_complete_cycle():
+    from dataclasses import replace
+    initial,cut=JointPolicy(3,8),JointPolicy(2,8)
+    cadence=replace(cut,trim_replay_interval=2)
+    tuner=guarded([initial,cut,cadence])
+    observe_costs(tuner,[99,15,15,99,10,10,99,2,12])
+    assert tuner.phase=='confirm' and tuner.policy==cadence
+    observe_costs(tuner,[3])
+    assert not tuner.stable
+    observe_costs(tuner,[11])
+    assert tuner.stable and tuner.policy==cadence and tuner.frozen_at_step==11
+
+
+def test_periodic_confirmation_drift_returns_previous_winner():
+    from dataclasses import replace
+    initial,cut=JointPolicy(3,8),JointPolicy(2,8)
+    cadence=replace(cut,trim_replay_interval=2)
+    tuner=guarded([initial,cut,cadence])
+    observe_costs(tuner,[99,15,15,99,10,10,99,2,12,3,19])
+    assert tuner.phase=='fallback' and tuner.policy==cut
+    observe_costs(tuner,[10])
+    assert tuner.stable and tuner.policy==cut and tuner.frozen_at_step==12

@@ -122,6 +122,7 @@ class PeakResidencyPlanner:
                 h2d_bandwidth_gbps=trace.h2d_bandwidth_gbps,
                 transfer_window_scale=self._transfer_window_scale,
                 limit_prefetch_window=self._limit_prefetch_window,
+                transfer_cost_samples=trace.transfer_cost_samples,
             )
             schedule, profile.resident_bytes = self._apply_communication_masking(masking_context)
         else:

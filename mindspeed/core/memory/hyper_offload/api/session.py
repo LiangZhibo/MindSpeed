@@ -51,9 +51,10 @@ def _empty_accelerator_cache(*, retain_physical: bool = False) -> bool | None:
     for name in ("npu", "cuda"):
         backend = getattr(torch, name, None)
         if backend is not None and backend.is_initialized():
-            if retain_physical and name == "npu":
+            virtual_trim = getattr(backend, "empty_virt_addr_cache", None)
+            if retain_physical and name == "npu" and callable(virtual_trim):
                 try:
-                    backend.empty_virt_addr_cache()
+                    virtual_trim()
                 except RuntimeError as error:
                     if "Unsupported config for empty_virt_addr_cache" not in str(error):
                         raise
@@ -113,6 +114,7 @@ class OffloadSession:
         self.planner = config.planner or GreedyResidencyPlanner()
         self.residency_manager = ResidencyManager(
             max_host_bytes=config.max_offload_activation_mb * 1024**2,
+            codec=config.codec,
             allow_pageable_fallback=True,
         )
         self.executor: WarmupExecutor | ReplayExecutor = WarmupExecutor(
@@ -128,6 +130,10 @@ class OffloadSession:
         self._virtual_cache_supported = None
         self._cache_reclaim_threshold_bytes = None
         self._cache_reclaim_lock = threading.Lock()
+        self.record_cache_reclaim = config.record_cache_reclaim
+        # check_seconds includes reclaim_seconds; never add the two totals.
+        # These counters are independent of last_trim_seconds at step entry.
+        self.cache_reclaim_stats = dict(checks=0, calls=0, check_seconds=0.0, reclaim_seconds=0.0)
 
     def _reclaim_before_allocation(self, func):
         """Unmap inactive NPU cache before allocator pressure forces retries."""
@@ -136,20 +142,33 @@ class OffloadSession:
         backend = getattr(torch, "npu", None)
         if backend is None or not backend.is_initialized() or self._virtual_cache_supported is False:
             return
-        with self._cache_reclaim_lock:
-            if self._cache_reclaim_threshold_bytes is None:
-                total_bytes = backend.get_device_properties(backend.current_device()).total_memory
-                self._cache_reclaim_threshold_bytes = (
-                    total_bytes * _CACHE_RECLAIM_RESERVED_NUMERATOR
-                    // _CACHE_RECLAIM_RESERVED_DENOMINATOR
-                )
-            stats = backend.memory_stats_as_nested_dict()
-            reserved = stats["reserved_bytes"]["all"]["current"]
-            allocated = stats["allocated_bytes"]["all"]["current"]
-            if (reserved < self._cache_reclaim_threshold_bytes
-                    or reserved - allocated < _CACHE_RECLAIM_MIN_INACTIVE_BYTES):
-                return
-            self._virtual_cache_supported = _empty_accelerator_cache(retain_physical=True)
+        recording = self.record_cache_reclaim
+        started = time.perf_counter() if recording else None
+        try:
+            with self._cache_reclaim_lock:
+                if self._cache_reclaim_threshold_bytes is None:
+                    total_bytes = backend.get_device_properties(backend.current_device()).total_memory
+                    self._cache_reclaim_threshold_bytes = (
+                        total_bytes * _CACHE_RECLAIM_RESERVED_NUMERATOR
+                        // _CACHE_RECLAIM_RESERVED_DENOMINATOR
+                    )
+                stats = backend.memory_stats_as_nested_dict()
+                reserved = stats["reserved_bytes"]["all"]["current"]
+                allocated = stats["allocated_bytes"]["all"]["current"]
+                if (reserved < self._cache_reclaim_threshold_bytes
+                        or reserved - allocated < _CACHE_RECLAIM_MIN_INACTIVE_BYTES):
+                    return
+                reclaim_started = time.perf_counter() if recording else None
+                try:
+                    self._virtual_cache_supported = _empty_accelerator_cache(retain_physical=True)
+                finally:
+                    if recording:
+                        self.cache_reclaim_stats['calls'] += 1
+                        self.cache_reclaim_stats['reclaim_seconds'] += time.perf_counter() - reclaim_started
+        finally:
+            if recording:
+                self.cache_reclaim_stats['checks'] += 1
+                self.cache_reclaim_stats['check_seconds'] += time.perf_counter() - started
 
     # ------------------------------------------------------------------
     # Active session lookup (used by skip_offload decorator)

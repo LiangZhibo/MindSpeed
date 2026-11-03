@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from ...ir.transfer import transfer_duration_ms, validate_transfer_samples
+
 from bisect import bisect_left, bisect_right
 import math
 
@@ -78,11 +80,12 @@ def transfer_window_bounds(context: MaskingContext) -> tuple[dict, dict]:
         raise ValueError("transfer window scale must be finite and nonnegative")
     if any(not math.isfinite(bw) or bw <= 0 for bw in (context.d2h_bandwidth_gbps, context.h2d_bandwidth_gbps)):
         raise ValueError("transfer windows require positive finite bandwidths")
+    validate_transfer_samples(context.transfer_cost_samples)
     release, prefetch = {}, {}
     for candidate in context.selected_candidates:
         # Trace bandwidths use GiB/s; the timer reports milliseconds.
-        d2h_ms = candidate.size_bytes / (context.d2h_bandwidth_gbps * 2**30) * 1000 * scale
-        h2d_ms = candidate.size_bytes / (context.h2d_bandwidth_gbps * 2**30) * 1000 * scale
+        d2h_ms = transfer_duration_ms(candidate.size_bytes,context.d2h_bandwidth_gbps,context.transfer_cost_samples,'d2h') * scale
+        h2d_ms = transfer_duration_ms(candidate.size_bytes,context.h2d_bandwidth_gbps,context.transfer_cost_samples,'h2d') * scale
         copy_after = candidate.copy_start.op_id + 1
         release_after = bisect_left(prefix, prefix[copy_after] + d2h_ms)
         release[candidate.selection_key] = max(candidate.release_start.op_id, release_after - 1)
