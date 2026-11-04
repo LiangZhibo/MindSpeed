@@ -65,6 +65,18 @@ class TestShadowTensor(unittest.TestCase):
         self.assertEqual(result.dtype, self.t.dtype)
         self.assertEqual(result.stride(), self.t.stride())
 
+    def test_tolist_resolves_shadow_storage(self) -> None:
+        """Python metadata consumers can read values from a shadow tensor."""
+        t = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+        buffer = PhysicalBuffer(device=t.device)
+        storage = t.untyped_storage()
+        dev_view = torch.empty(0, dtype=torch.uint8, device=t.device)
+        dev_view.set_(storage, 0, (storage.size(),), (1,))
+        buffer.device_buffer = dev_view
+
+        shadow = ShadowTensor(t, buffer, storage_id=1)
+        self.assertEqual(shadow.tolist(), [[1, 2], [3, 4]])
+
     def test_resolve_raises_when_no_device_or_host(self) -> None:
         self.buffer.device_buffer = None
         self.buffer.host_buffer = None

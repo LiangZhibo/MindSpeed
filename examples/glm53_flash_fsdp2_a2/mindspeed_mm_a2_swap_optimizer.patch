@@ -1,0 +1,60 @@
+diff --git a/mindspeed_mm/fsdp/optimizer/swap_optimizer.py b/mindspeed_mm/fsdp/optimizer/swap_optimizer.py
+index 24ef283..a4e48d9 100644
+--- a/mindspeed_mm/fsdp/optimizer/swap_optimizer.py
++++ b/mindspeed_mm/fsdp/optimizer/swap_optimizer.py
+@@ -27,2 +27,2 @@ class SwapOptimizerOperate():
+-            SwapOptimizerOperate.swap_to_device_stream = torch.accelerator.Stream()
+-            SwapOptimizerOperate.swap_to_host_stream = torch.accelerator.Stream()
++            SwapOptimizerOperate.swap_to_device_stream = torch.npu.Stream()
++            SwapOptimizerOperate.swap_to_host_stream = torch.npu.Stream()
+@@ -75 +75 @@ class SwapOptimizerOperate():
+-        self.total_memory = torch.accelerator.get_device_properties(torch.accelerator.current_device()).total_memory
++        self.total_memory = torch.npu.get_device_properties(torch.npu.current_device()).total_memory
+@@ -80 +80 @@ class SwapOptimizerOperate():
+-        used_memory = torch.accelerator.memory_allocated()
++        used_memory = torch.npu.memory_allocated()
+@@ -93 +93 @@ class SwapOptimizerOperate():
+-                torch.accelerator.current_stream().wait_event(event)
++                torch.npu.current_stream().wait_event(event)
+@@ -102 +102 @@ class SwapOptimizerOperate():
+-                torch.accelerator.current_stream().wait_event(event)
++                torch.npu.current_stream().wait_event(event)
+@@ -115 +115 @@ class SwapOptimizerOperate():
+-        self.swap_to_device_events_map[param] = torch.accelerator.current_stream().record_event()
++        self.swap_to_device_events_map[param] = torch.npu.current_stream().record_event()
+@@ -120 +120 @@ class SwapOptimizerOperate():
+-            torch.accelerator.current_stream().wait_event(event)
++            torch.npu.current_stream().wait_event(event)
+@@ -133 +133 @@ class SwapOptimizerOperate():
+-        self.swap_to_host_events_map[param] = torch.accelerator.current_stream().record_event()
++        self.swap_to_host_events_map[param] = torch.npu.current_stream().record_event()
+@@ -136 +136 @@ class SwapOptimizerOperate():
+-        torch.accelerator.current_stream().wait_stream(self.swap_to_host_stream)
++        torch.npu.current_stream().wait_stream(self.swap_to_host_stream)
+@@ -138,2 +138,2 @@ class SwapOptimizerOperate():
+-        with torch.accelerator.stream(self.swap_to_device_stream):
+-            torch.accelerator.current_stream().wait_stream(self.swap_to_host_stream)
++        with torch.npu.stream(self.swap_to_device_stream):
++            torch.npu.current_stream().wait_stream(self.swap_to_host_stream)
+@@ -141,3 +141,10 @@ class SwapOptimizerOperate():
+-            while index < len(params_list) and (swap_count + params_list[index].to_local().numel() <= self.swap_numel):
+-                self.swap_tensors_to_device(params_list[index])
+-                swap_count += params_list[index].to_local().numel()
++            while index < len(params_list):
++                param = params_list[index]
++                if param.grad is None:
++                    index += 1
++                    continue
++                param_numel = param.to_local().numel()
++                if swap_count + param_numel > self.swap_numel:
++                    break
++                self.swap_tensors_to_device(param)
++                swap_count += param_numel
+@@ -220 +227 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
+-                group['step'] = torch.tensor(1, dtype=torch.int64, device=torch.accelerator.current_device_index())
++                group['step'] = torch.tensor(1, dtype=torch.int64, device=torch.npu.current_device())
+@@ -251,2 +258,2 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
+-            working_stream = torch.accelerator.current_stream()
+-            with torch.accelerator.stream(self.swap_to_host_stream):
++            working_stream = torch.npu.current_stream()
++            with torch.npu.stream(self.swap_to_host_stream):

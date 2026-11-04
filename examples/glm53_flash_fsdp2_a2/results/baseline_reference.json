@@ -1,0 +1,61 @@
+{
+  "model": "GLM-5.3-Flash proportional random-init proxy",
+  "shape": "7L/64E/top-8/5V",
+  "parameters": 12437456762,
+  "mode": "strict_baseline",
+  "recompute": "all 7 language + 5 vision blocks",
+  "hyperoffload": false,
+  "op_replay": false,
+  "fsdp_size": 2,
+  "reference_run": "/data/disk1/machangwei/glm53-env/experiments/1103_glm53/20261103_150643_strict_baseline_npu23",
+  "core_reference_commit": "5f28f9dd",
+  "numa_node": 4,
+  "npu_pair": [
+    2,
+    3
+  ],
+  "task_queue_enable": 1,
+  "allocator": "expandable_segments:True",
+  "per_rank": {
+    "rank0": {
+      "completed_iterations": 20,
+      "peak_allocated_bytes": 63223125504,
+      "first_10_peak_allocated_bytes": 63222370816,
+      "iterations_2_to_10_mean_seconds": 23.158336798350017
+    },
+    "rank1": {
+      "completed_iterations": 20,
+      "peak_allocated_bytes": 63223125504,
+      "first_10_peak_allocated_bytes": 63222370816,
+      "iterations_2_to_10_mean_seconds": 23.181279685762192
+    }
+  },
+  "accepted_oom_control": {
+    "disabled_recompute_language_layers": [
+      0,
+      3
+    ],
+    "run": "/data/disk1/machangwei/glm53-env/experiments/1103_glm53/20261103_160406_partial_no_offload_npu23",
+    "completed_iterations": 0,
+    "outcome": "NPU OOM in first backward on both ranks",
+    "allocated_gib_at_failure": 58.03,
+    "requested_gib": 2.0,
+    "free_gib_at_failure": [
+      1.84,
+      1.85
+    ]
+  },
+  "mindspeed_mm_activation_stash": false,
+  "evidence_sha256": {
+    "glm53-env/experiments/1103_glm53/20261103_150643_strict_baseline_npu23/config.yaml": "15a3947fe880070213fc17e5947689ef2e71e25d085a6cfbee28f4a1fdfe7d1a",
+    "glm53-env/experiments/1103_glm53/20261103_150643_strict_baseline_npu23/launch.txt": "562a47b7cf15987b7b884de4e2b5f10cc455a060b8c2fb3923e2ff7a653a93dd",
+    "glm53-env/experiments/1103_glm53/20261103_150643_strict_baseline_npu23/train.log": "a87709594aca68e7ee5e8906d08127bf2439576023ee3ef0615165d49c6a0060",
+    "glm53-env/experiments/1103_glm53/20261103_150643_strict_baseline_npu23/metrics/rank0.jsonl": "efa76598625b50e02cd64edb8f42a78334ae21df49d22d0f151a323dd593afac",
+    "glm53-env/experiments/1103_glm53/20261103_150643_strict_baseline_npu23/metrics/rank1.jsonl": "7fabe46c37996580cf1a6eb2677e5c4cde2af4ba8e4f362942db283e5683c612",
+    "glm53-env/experiments/1103_glm53/20261103_160406_partial_no_offload_npu23/config.yaml": "d91b52df00b2716ff2e5d3eaa742231792d3ac1983951e04186b0f3bc29819c8",
+    "glm53-env/experiments/1103_glm53/20261103_160406_partial_no_offload_npu23/launch.txt": "ac5801a41ddba924060875ddbaf56e584c3ec509ae1760e3a3f502d311797a64",
+    "glm53-env/experiments/1103_glm53/20261103_160406_partial_no_offload_npu23/train.log": "d1bb469ba2a8735dde0423f042e181974e35ef4f4cf2d170dea6a2d075337147"
+  },
+  "future_runtime_core_commit": "11b3ef7f815276b97e0ec8d3700322810f2ae4fc",
+  "future_runtime_performance_measured": false
+}
