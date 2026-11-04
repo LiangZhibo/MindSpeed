@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from ...ir.transfer import transfer_duration_ms, validate_transfer_samples
+from .transfer_calendar import place_transfers
 
 from bisect import bisect_left, bisect_right
 import math
@@ -36,7 +37,7 @@ from mindspeed.core.memory.hyper_offload.planning.peak_strategy.types import (
 
 def apply_communication_masking(context: MaskingContext) -> tuple[ResidencySchedule, list[int]]:
     """Rebuild the schedule with optional release/prefetch overlap."""
-    release_bounds, prefetch_bounds = transfer_window_bounds(context)
+    release_bounds, prefetch_bounds = ({}, {}) if context.shared_transfer_calendar else transfer_window_bounds(context)
     release_positions, resident_bytes = maximize_release_positions(
         context.selected_candidates,
         context.resident_bytes,
@@ -50,6 +51,16 @@ def apply_communication_masking(context: MaskingContext) -> tuple[ResidencySched
         release_positions,
         prefetch_bounds,
     )
+    copy_positions = None
+    if context.shared_transfer_calendar:
+        copy_positions, releases, prefetches = place_transfers(context, release_positions, prefetch_positions)
+        for candidate in context.selected_candidates:
+            key = candidate.selection_key
+            apply_residency_delta(resident_bytes, -candidate.size_bytes,
+                                  releases[key] + 1, release_positions[key] + 1)
+            apply_residency_delta(resident_bytes, -candidate.size_bytes,
+                                  prefetch_positions[key], prefetches[key])
+        release_positions, prefetch_positions = releases, prefetches
     schedule = build_masked_schedule(
         ScheduleBuildContext(
             selected_candidates=context.selected_candidates,
@@ -57,6 +68,7 @@ def apply_communication_masking(context: MaskingContext) -> tuple[ResidencySched
             prefetch_positions=prefetch_positions,
             releasable=context.releasable,
             retained_sids=context.retained_sids,
+            copy_positions=copy_positions,
         ),
     )
     return schedule, resident_bytes

@@ -44,6 +44,9 @@ class ResidencySchedule:
 
     pre: dict[int, list[ResidencyAction]] = field(default_factory=dict)
     post: dict[int, list[ResidencyAction]] = field(default_factory=dict)
+    # If a D2H action is delayed, the immutable codec selector still identifies
+    # the version-producing node, independently of the submission position.
+    copy_origins: dict[tuple[int, int], int] = field(default_factory=dict)
 
     def add_pre(self, op_id: int, kind: ResidencyActionType, storage_id: int) -> None:
         """Add pre."""

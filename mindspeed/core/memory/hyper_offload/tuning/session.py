@@ -56,6 +56,7 @@ class _RecordingPlanner:
             enable_communication_masking=policy.masking,
             transfer_window_scale=policy.transfer_window_scale,
             limit_prefetch_window=policy.limit_prefetch_window,
+            shared_transfer_calendar=policy.shared_transfer_calendar,
         )
         self.trace = None
         self.seconds = 0.0

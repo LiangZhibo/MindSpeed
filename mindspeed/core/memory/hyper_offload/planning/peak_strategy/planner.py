@@ -47,6 +47,7 @@ class PeakResidencyPlanner:
         enable_communication_masking: bool = False,
         transfer_window_scale: float | None = None,
         limit_prefetch_window: bool = True,
+        shared_transfer_calendar: bool = False,
         **score_weights: float,
     ) -> None:
         if weights is not None and score_weights:
@@ -65,6 +66,11 @@ class PeakResidencyPlanner:
         if not isinstance(limit_prefetch_window, bool):
             raise ValueError('limit_prefetch_window must be a boolean')
         self._limit_prefetch_window = limit_prefetch_window
+        if not isinstance(shared_transfer_calendar, bool):
+            raise ValueError('shared_transfer_calendar must be a boolean')
+        if shared_transfer_calendar and not enable_communication_masking:
+            raise ValueError('the shared transfer calendar requires communication masking')
+        self._shared_transfer_calendar = shared_transfer_calendar
 
     @staticmethod
     def _parse_score_weights(score_weights: dict[str, float]) -> ScoreWeights:
@@ -123,6 +129,7 @@ class PeakResidencyPlanner:
                 transfer_window_scale=self._transfer_window_scale,
                 limit_prefetch_window=self._limit_prefetch_window,
                 transfer_cost_samples=trace.transfer_cost_samples,
+                shared_transfer_calendar=self._shared_transfer_calendar,
             )
             schedule, profile.resident_bytes = self._apply_communication_masking(masking_context)
         else:

@@ -234,7 +234,8 @@ class ReplayExecutor(BaseExecutor):
                 # H2D restores from its already-recorded encoding instead.
                 set_node = getattr(self.residency_manager, "set_transfer_node", None)
                 if set_node is not None:
-                    set_node(self.op_idx, "post", op_guide.name)
+                    origin = self._schedule.copy_origins.get((self.op_idx, sid), self.op_idx)
+                    set_node(origin, "post", self._guide[origin].name)
                 self.residency_manager.copy_d2h(sid)
             elif action.kind == ResidencyActionType.RELEASE_DEVICE:
                 if self._managed_sids is None or sid in self._managed_sids:
