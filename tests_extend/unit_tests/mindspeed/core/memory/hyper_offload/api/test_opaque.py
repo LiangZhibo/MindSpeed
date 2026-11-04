@@ -204,6 +204,28 @@ class TestSkipOffloadDecorator(unittest.TestCase):
 
         torch.testing.assert_close(grad_warmup, x_ref.grad, rtol=1e-4, atol=1e-6)
 
+    def test_skip_offload_passes_native_input_to_opaque_body(self) -> None:
+        """Opaque bodies receive real tensors for custom kernels using raw pointers."""
+        from mindspeed.core.memory.hyper_offload.execution.tensor import ShadowTensor
+
+        observed = []
+
+        @skip_offload
+        def custom_kernel(x):
+            observed.append(isinstance(x, ShadowTensor))
+            return x.sin()
+
+        x = torch.tensor([0.5, 1.0], requires_grad=True)
+        session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))
+        with session:
+            shadow = session.executor.make_shadow(91, x)
+            result = custom_kernel(shadow)
+            result.sum().backward()
+
+        self.assertIsInstance(shadow, ShadowTensor)
+        self.assertFalse(observed[0])
+        torch.testing.assert_close(result, torch.sin(x.detach()))
+
     def test_skip_offload_replay_preserves_gradients(self) -> None:
         """Replay should also preserve gradients through skip_offload regions."""
         session = OffloadSession(OffloadConfig(max_resident_activation_mb=1))

@@ -1,0 +1,15 @@
+{
+  "README.md": "2f8074c1aeae50d51a2701772bed2cf1d89a0144cc1696644fb3721e9fa5ec39",
+  "assets.sha256.json": "f433e432fe551fd15bfde5dce6b4129dc4333dc974e2c3cc7a268aa58af85199",
+  "config.hyperoffload.template.yaml": "b23a3595a63fde7463629c99d1d0e70542fdc6a297d20828a454d2aace8fc3e2",
+  "config.strict_baseline.template.yaml": "c8761272961408cde1376f28534b1e30a394252a180eda1c36234617d40a668a",
+  "launch_glm53_pair.sh": "7226228c74712764aa7b4862220c7ed6244c75506b8505e14f05fec38e4904c1",
+  "mindspeed_mm_a2_swap_optimizer.patch": "4c4de4f1f0f6036e35da680bfde9ffa7aafd41294efa1b4d0ebb7054a3160f4e",
+  "model_metadata/GLM-5.3-Flash-l7e64v5/config.json": "5ecea86930442036ca0b0ce5e7c97ffc4921fa12f014829f438e7355337f7d51",
+  "numa_exec.py": "a1be3cea32437569ec5bbe54bff5e2f2795155911f0e1cbcef3b16d0c2447047",
+  "render_config.py": "490e461cf45379eee4f870081582bbae8f94208140348ffd58049256eee1eeb3",
+  "run_comparison_when_free.sh": "aa8b807410f180c1c02fca7131d0e71ba03c4a2e1cc4b8a78e125568b202a1d7",
+  "run_glm53.py": "0e9685d733096dac50d83bba21ca44a8f96aaaf58c0eb8ff6867fb93278a385f",
+  "summarize_comparison.py": "67e34402ad5ec8ce710f12f872b8fcf424bea096e8c6dba9cf5c1e6356f61850",
+  "validate_runtime.py": "d643712dcdd39de3af8fdb322404269fee72f19ef95e158ce0a0d0c70cebdf8f"
+}
