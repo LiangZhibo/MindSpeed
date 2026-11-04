@@ -35,7 +35,7 @@ python -m tools.hyper_offload.device_window_profile observed-events.json device-
 | 区域的 `samples` | 每个硬件样本对应一项，包含移除重计算后要扣除的 `removed_compute` 区间及 `packets` 列表。不可归属的版本应从候选排除。 |
 | 包字段 | `key` 是参考版本的去重标识，`size` 是原始字节数。`ready`、`first_pressure`、`peak_pressure`、`prefetch`、`use` 是该样本中产生、需释放和反向需求的时间界限。`d2h`、`h2d` 是两方向实测或由尺寸校准估计的包时长。 |
 | 可选 `native_groups` | 使用与区域相同的字段，另以 `replaces` 指明整棵子树内将撤销的参考检查点。完整子树的原始激活和工作集都要计入 phase 容量。 |
-| 可选 `calendar_comparison`、`codec_origins` | 前者保存同图、同设备、同结构的原计划与双向重排样本，使较快方案成为待验证起点。后者是已测参考图上愿意再次尝试压缩的“产生算子位置、原始字节数”列表。运行时按新捕获的实际版本和新 codec 校准重新匹配。 |
+| 可选 `calendar_comparison`、`codec_origins` | 前者保存同图、同设备、同结构的原计划与双向重排样本，使较快方案成为待验证起点。后者是已测参考图上愿意再次尝试压缩的“产生算子位置、原始字节数、可选访问序号”列表。访问序号取当前算子的存储访问记录下标，可以区分同一个算子内大小相同的多个版本。运行时按新捕获的实际版本和新 codec 校准重新匹配。 |
 
 导出工具先对硬件计算事件求并集，再扣除所有 DMA。它同时生成扣除集合通信的第二组区间。两组区间代表两种资源竞争假设。集体通信可以与 DMA 重叠，哪一种分配更快，由完整训练步决定。直接使用已有窗口时，分别传入 `samples` 和可选的 `collective_free_samples`。
 

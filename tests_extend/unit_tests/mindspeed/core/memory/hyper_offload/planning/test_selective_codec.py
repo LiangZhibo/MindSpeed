@@ -45,6 +45,19 @@ def test_profiled_origin_is_resolved_again_on_the_current_peak_plan():
     assert not scopes(((0, 100),), (profile(size=200),))
 
 
+def test_access_position_disambiguates_equal_packets_from_one_op():
+    captured = trace(packets=3, limit=500)
+    captured.storage_sizes[99] = 500
+    model = PeakWindowModel(captured)
+    def matched(origins):
+        return [s for s in codec_scopes(model, (profile(),), ("opaque",), device_headroom=10**8,
+                                        host_headroom=10**8, prior_origins=origins)
+                if s.purpose == "profiled_anchor"]
+    assert not matched(((0, 100),))
+    assert matched(((0, 100, 2),))[0].nodes == ((0, "post", 2, 100),)
+    assert not matched(((0, 100, 3),))
+
+
 def test_capacity_uses_worst_case_device_and_full_new_host_bucket_not_ratio():
     model=PeakWindowModel(trace())
     wide=codec_scopes(model,(profile(ratio=.01),),(),device_headroom=10**8,host_headroom=10**8)[0]

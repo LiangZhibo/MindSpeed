@@ -179,11 +179,9 @@ class DeviceWindowProfile:
         self.window_scale = None if scale is None else _number(scale)
         self.op_count = _integer(data["anchor_op_count"])
         self.device_mb = _integer(data["resident_mb"])
-        self.codec_origins = tuple(
-            (_integer(op), _integer(size)) for op, size in data.get("codec_origins", ())
-        )
+        self.codec_origins = tuple(tuple(_integer(v) for v in row) for row in data.get("codec_origins", ()))
         if len(set(self.codec_origins)) != len(self.codec_origins) or any(
-            op >= self.op_count or size == 0 for op, size in self.codec_origins
+            len(row) not in (2, 3) or row[0] >= self.op_count or row[1] == 0 for row in self.codec_origins
         ):
             raise ValueError("invalid profiled codec origins")
         self.prefer_shared_calendar = False
