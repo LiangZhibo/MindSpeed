@@ -20,6 +20,18 @@ from torch.utils._pytree import tree_flatten
 from mindspeed.core.memory.hyper_offload.execution.tensor import ShadowTensor
 
 
+def _scalar_metadata(value, scalar_values):
+    """Return a replay-stable representation for non-tensor dispatch inputs."""
+    # profiler._record_function_* carries a torch.ScriptObject token whose repr
+    # contains its process-local address.  Warmup and replay create different
+    # token objects for the same event, so that address must not be part of the
+    # replay contract.  Keep the type to validate the operator's input shape.
+    script_object = getattr(torch, "ScriptObject", None)
+    if script_object is not None and isinstance(value, script_object):
+        return (type(value), None)
+    return (type(value), repr(value) if scalar_values else None)
+
+
 def op_identity(func):
     """Include the namespace and overload for native operators."""
     return str(func) if hasattr(func, "_schema") else func.__name__
@@ -32,7 +44,7 @@ def signature(value, scalar_values=True):
     metadata = []
     for leaf in leaves:
         if not isinstance(leaf, torch.Tensor):
-            metadata.append((type(leaf), repr(leaf) if scalar_values else None))
+            metadata.append(_scalar_metadata(leaf, scalar_values))
             continue
         physical = leaf._buffer.device_buffer if isinstance(leaf, ShadowTensor) else leaf
         if physical is None:

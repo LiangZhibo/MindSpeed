@@ -1,0 +1,8 @@
+{
+  "model-assets/GLM-5.3-Flash-l7e64v5-proportional-proxy/config.json": "5ecea86930442036ca0b0ce5e7c97ffc4921fa12f014829f438e7355337f7d51",
+  "model-assets/GLM-5.3-Flash-l7e64v5-proportional-proxy/tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+  "model-assets/GLM-5.3-Flash-l7e64v5-proportional-proxy/tokenizer_config.json": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+  "model-assets/GLM-5.3-Flash-l7e64v5-proportional-proxy/processor_config.json": "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+  "data/mock_vl/mock_data_pic_num_1_textlen_2048_num_samples_64.json": "83ab68f7ba49cb8f62287e6374b734ff1bfac200869068fef0b2cc18b63734ef",
+  "data/mock_vl/test_pic_h224_w224.jpg": "8b7119949b697c2d4f9f489c8b2a82894bb3832b9b6bb4e021700df4844daac9"
+}

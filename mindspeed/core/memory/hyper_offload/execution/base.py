@@ -44,7 +44,16 @@ class OpaqueRegionStart(torch.autograd.Function):
         ctx.func_name = func_name
         ctx.generation = executor._generation
         ctx.set_materialize_grads(False)
-        return (dummy,) + inputs
+        # Opaque bodies may call custom kernels that use raw storage pointers
+        # and do not participate in __torch_dispatch__. Give them native views
+        # while this autograd boundary preserves the gradient edge to each
+        # original ShadowTensor input.
+        with torch.utils._python_dispatch._disable_current_modes(), torch._C._DisableTorchDispatch():
+            native_inputs = tuple(
+                value.resolve() if isinstance(value, ShadowTensor) else value
+                for value in inputs
+            )
+        return (dummy,) + native_inputs
 
     @staticmethod
     def backward(ctx: Any, grad_dummy: Any, *grad_inputs: Any) -> Any:  # pylint: disable=unused-argument
@@ -118,7 +127,13 @@ class OpaqueRegionEnd(torch.autograd.Function):
         executor.on_op_begin(bwd_dummy, inputs, {})
 
         executor.enter_opaque_region()
-        return (None, None, None, torch.zeros(1)) + grad_outputs
+        # Custom kernels inside an opaque backward may use data pointers
+        # directly, bypassing tensor dispatch. Resolve incoming gradients while
+        # the boundary protects them from eviction, before calling that code.
+        with torch.utils._python_dispatch._disable_current_modes(), torch._C._DisableTorchDispatch():
+            native_grads = tuple(value.resolve() if isinstance(value, ShadowTensor) else value
+                                 for value in grad_outputs)
+        return (None, None, None, torch.zeros(1)) + native_grads
 
 
 class BaseExecutor(ABC):

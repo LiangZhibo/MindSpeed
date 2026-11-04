@@ -106,6 +106,16 @@ class ShadowTensor(torch.Tensor):
         torch._C._set_neg(result, self.is_neg())
         return result
 
+    def tolist(self) -> list | Any:
+        """Return tensor values as nested Python lists.
+
+        ``Tensor.tolist`` bypasses ``__torch_dispatch__`` and rejects tensor
+        subclasses. Resolve the managed storage explicitly before delegating
+        so metadata consumers can use the regular Tensor API.
+        """
+        with torch._C._DisableTorchDispatch():  # pylint: disable=protected-access
+            return self.resolve().tolist()
+
     # ------------------------------------------------------------------
     # PyTorch dispatch
     # ------------------------------------------------------------------

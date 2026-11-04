@@ -1,0 +1,115 @@
+diff --git a/mindspeed_mm/fsdp/optimizer/swap_optimizer.py b/mindspeed_mm/fsdp/optimizer/swap_optimizer.py
+index 24ef283..a4e48d9 100644
+--- a/mindspeed_mm/fsdp/optimizer/swap_optimizer.py
++++ b/mindspeed_mm/fsdp/optimizer/swap_optimizer.py
+@@ -24,8 +24,8 @@ class SwapOptimizerOperate():
+             self.state_keys = state_keys
+
+         if SwapOptimizerOperate.swap_to_device_stream is None:
+-            SwapOptimizerOperate.swap_to_device_stream = torch.accelerator.Stream()
+-            SwapOptimizerOperate.swap_to_host_stream = torch.accelerator.Stream()
++            SwapOptimizerOperate.swap_to_device_stream = torch.npu.Stream()
++            SwapOptimizerOperate.swap_to_host_stream = torch.npu.Stream()
+
+         # create all parameters list for step
+         self.param_to_group_map = {}
+@@ -72,12 +72,12 @@ class SwapOptimizerOperate():
+         params = list(self.param_to_device_states_map.keys())
+         # Define how many bytes the optimizer state of each parameter occupies.
+         self.byte_param = 4 if params[0].dtype == torch.float32 else 2
+-        self.total_memory = torch.accelerator.get_device_properties(torch.accelerator.current_device()).total_memory
++        self.total_memory = torch.npu.get_device_properties(torch.npu.current_device()).total_memory
+
+     def get_swap_numel_from_unused_memory(self):
+         # The available accelerator memory can be used to calculate
+         # the number of parameters that can be transferred simultaneously.
+-        used_memory = torch.accelerator.memory_allocated()
++        used_memory = torch.npu.memory_allocated()
+         unused_memory = self.total_memory - used_memory
+
+         # for example: the memory of exp_avg and exp_avg_sq of  is  (self.byte_param * 2)
+@@ -90,7 +90,7 @@ class SwapOptimizerOperate():
+         for param in self.param_to_cpu_states_map.keys():
+             event = self.swap_to_host_events_map.get(param, None)
+             if event is not None:
+-                torch.accelerator.current_stream().wait_event(event)
++                torch.npu.current_stream().wait_event(event)
+                 self.swap_to_host_events_map[param] = None
+
+     def swap_all_to_device(self):
+@@ -99,7 +99,7 @@ class SwapOptimizerOperate():
+         for param in self.param_to_cpu_states_map.keys():
+             event = self.swap_to_device_events_map.get(param, None)
+             if event is not None:
+-                torch.accelerator.current_stream().wait_event(event)
++                torch.npu.current_stream().wait_event(event)
+                 self.swap_to_device_events_map[param] = None
+
+     def swap_tensors_to_device(self, param):
+@@ -112,12 +112,12 @@ class SwapOptimizerOperate():
+                     device_state[key].storage().resize_(cpu_state[key].storage().size())
+                     device_state[key].copy_(cpu_state[key], non_blocking=True)
+
+-        self.swap_to_device_events_map[param] = torch.accelerator.current_stream().record_event()
++        self.swap_to_device_events_map[param] = torch.npu.current_stream().record_event()
+
+     def wait_swap_to_device_event(self, param):
+         event = self.swap_to_device_events_map.get(param, None)
+         if event is not None:
+-            torch.accelerator.current_stream().wait_event(event)
++            torch.npu.current_stream().wait_event(event)
+             self.swap_to_device_events_map[param] = None
+
+     def swap_tensors_to_host(self, param):
+@@ -130,17 +130,24 @@ class SwapOptimizerOperate():
+                     cpu_state[key].copy_(device_state[key], non_blocking=True)
+                     device_state[key].storage().resize_(0)
+
+-        self.swap_to_host_events_map[param] = torch.accelerator.current_stream().record_event()
++        self.swap_to_host_events_map[param] = torch.npu.current_stream().record_event()
+
+     def swap_batch_tensor_to_device(self, params_list, index):
+-        torch.accelerator.current_stream().wait_stream(self.swap_to_host_stream)
++        torch.npu.current_stream().wait_stream(self.swap_to_host_stream)
+         swap_count = 0
+-        with torch.accelerator.stream(self.swap_to_device_stream):
+-            torch.accelerator.current_stream().wait_stream(self.swap_to_host_stream)
++        with torch.npu.stream(self.swap_to_device_stream):
++            torch.npu.current_stream().wait_stream(self.swap_to_host_stream)
+             self.swap_numel = self.get_swap_numel_from_unused_memory()
+-            while index < len(params_list) and (swap_count + params_list[index].to_local().numel() <= self.swap_numel):
+-                self.swap_tensors_to_device(params_list[index])
+-                swap_count += params_list[index].to_local().numel()
++            while index < len(params_list):
++                param = params_list[index]
++                if param.grad is None:
++                    index += 1
++                    continue
++                param_numel = param.to_local().numel()
++                if swap_count + param_numel > self.swap_numel:
++                    break
++                self.swap_tensors_to_device(param)
++                swap_count += param_numel
+                 index += 1
+
+         if swap_count == 0:
+@@ -217,7 +224,7 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
+                 if group['step'].is_cpu:
+                     group['step'] = group['step'].cuda()
+             else:
+-                group['step'] = torch.tensor(1, dtype=torch.int64, device=torch.accelerator.current_device_index())
++                group['step'] = torch.tensor(1, dtype=torch.int64, device=torch.npu.current_device())
+
+         swap_count = 0
+         params_list = list(self.param_to_group_map.keys())
+@@ -248,8 +255,8 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
+                                 [group['step']], lr=group['lr'], beta1=beta1, beta2=beta2, weight_decay=group['weight_decay'],
+                                 eps=group['eps'], amsgrad=amsgrad, maximize=group['maximize'])
+
+-            working_stream = torch.accelerator.current_stream()
+-            with torch.accelerator.stream(self.swap_to_host_stream):
++            working_stream = torch.npu.current_stream()
++            with torch.npu.stream(self.swap_to_host_stream):
+                 self.swap_to_host_stream.wait_stream(working_stream)
+                 swap_count -= param.to_local().numel()
+                 self.swap_tensors_to_host(param)
