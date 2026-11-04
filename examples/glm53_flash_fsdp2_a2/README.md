@@ -71,6 +71,8 @@ The fixed initial HyperOffload policy uses the peak planner, 2048 MiB resident a
 
 The first iteration includes tracing/planning and is excluded from the steady-time mean. Compare iterations 2–10 on the same pair, runtime, model, seed, allocator (`expandable_segments:True`), dataset, and optimizer. Include all iterations in peak-memory reporting. HyperOffload is an experimental GLM/FSDP integration; claim a performance result only if both ranks finish ten steps and record replay-phase transfers.
 
+For a rank-0 operator trace from one observed iteration, set `GLM53_PROFILE_STEP=5` when launching either mode. Profiling starts at iteration 1 so HyperOffload warmup and replay see the same profiler events; inspect the target step in the resulting trace. The profiler writes under that run's `profiler/` directory; keep profiled timings separate from unprofiled throughput measurements.
+
 The HyperOffload runner disables dispatch modes around `get_batch` within the session. `TrainEngine` creates the DataLoader iterator lazily, so fetching a batch with `TorchDispatchMode` active can fork workers that inherit the dispatch context. Those workers may spin in CPU preprocessing without returning a batch or launching NPU work. Keep data loading outside the activation tracking scope.
 
 The runner wraps GLM's `hc_split_sinkhorn`, `causal_conv1d`, `chunk_kda_ascendc`, and instance-level `sparse_flash_attention` custom autograd calls as opaque HyperOffload regions. These kernels use raw pointers, so their internal allocations cannot be represented by `ShadowTensor`. Their backward inputs are retained across the opaque boundary; surrounding attention and hyperconnection activations remain eligible for offload.

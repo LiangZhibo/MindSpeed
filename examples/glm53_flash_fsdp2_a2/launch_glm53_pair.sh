@@ -96,6 +96,17 @@ GLM53_STOP_AFTER_ITERS=${GLM53_STOP_AFTER_ITERS:-10}
 GLM53_OFFLOAD_DEVICE_MB=${GLM53_OFFLOAD_DEVICE_MB:-2048}
 GLM53_OFFLOAD_HOST_MB=${GLM53_OFFLOAD_HOST_MB:-32768}
 GLM53_OFFLOAD_PLANNER=${GLM53_OFFLOAD_PLANNER:-peak}
+GLM53_PROFILE_STEP=${GLM53_PROFILE_STEP:-}
+if [[ -n "$GLM53_PROFILE_STEP" ]]; then
+    [[ "$GLM53_PROFILE_STEP" =~ ^[0-9]+$ && "$GLM53_PROFILE_STEP" -ge 1 ]] || {
+        echo "GLM53_PROFILE_STEP must be a positive training iteration" >&2; exit 2;
+    }
+    PROFILE_LIMIT=$GLM53_STOP_AFTER_ITERS
+    [[ "$PROFILE_LIMIT" -gt 0 ]] || PROFILE_LIMIT=20
+    (( GLM53_PROFILE_STEP <= PROFILE_LIMIT )) || {
+        echo "profile step $GLM53_PROFILE_STEP exceeds the $PROFILE_LIMIT observed iterations" >&2; exit 2;
+    }
+fi
 printf 'mode=%s\nrunner_mode=%s\nnpu_pair=%s\nnuma_node=%s\nmaster_port=%s\ntask_queue_enable=%s\n' \
     "$MODE" "$RUNNER_MODE" "$PAIR" "$NODE_A" "$PORT" "$TASK_QUEUE_ENABLE" > "$RUN_DIR/launch.txt"
 printf 'configured_train_iters=20\nstop_after_iters=%s\n' "$GLM53_STOP_AFTER_ITERS" >> "$RUN_DIR/launch.txt"
@@ -109,6 +120,10 @@ if [[ "$MODE" == hyperoffload ]]; then
     printf 'offload_device_mb=%s\noffload_host_mb=%s\noffload_planner=%s\n' \
         "$GLM53_OFFLOAD_DEVICE_MB" "$GLM53_OFFLOAD_HOST_MB" "$GLM53_OFFLOAD_PLANNER" >> "$RUN_DIR/launch.txt"
 fi
+if [[ -n "$GLM53_PROFILE_STEP" ]]; then
+    printf 'profile_step=%s\nprofile_rank=0\nprofile_path=%s/profiler\n' \
+        "$GLM53_PROFILE_STEP" "$RUN_DIR" >> "$RUN_DIR/launch.txt"
+fi
 git -C "$MS_ROOT" status --short > "$RUN_DIR/mindspeed_status.txt"
 git -C "$MM_ROOT" status --short > "$RUN_DIR/mindspeed_mm_status.txt"
 git -C "$MM_ROOT" diff --binary > "$RUN_DIR/mindspeed_mm_local.patch"
@@ -118,7 +133,7 @@ cp "$EXAMPLE_ROOT/assets.sha256.json" "$RUN_DIR/assets.sha256.json"
 printf 'GLM53_RUN_DIR=%s\n' "$RUN_DIR"
 
 set +e
-docker exec -e "TASK_QUEUE_ENABLE=$TASK_QUEUE_ENABLE" -e "GLM53_DISABLE_RECOMPUTE_LAYERS=$GLM53_DISABLE_RECOMPUTE_LAYERS" -e "GLM53_STOP_AFTER_ITERS=$GLM53_STOP_AFTER_ITERS" \
+docker exec -e "TASK_QUEUE_ENABLE=$TASK_QUEUE_ENABLE" -e "GLM53_DISABLE_RECOMPUTE_LAYERS=$GLM53_DISABLE_RECOMPUTE_LAYERS" -e "GLM53_STOP_AFTER_ITERS=$GLM53_STOP_AFTER_ITERS" -e "GLM53_PROFILE_STEP=$GLM53_PROFILE_STEP" \
     -e "GLM53_OFFLOAD_DEVICE_MB=$GLM53_OFFLOAD_DEVICE_MB" -e "GLM53_OFFLOAD_HOST_MB=$GLM53_OFFLOAD_HOST_MB" -e "GLM53_OFFLOAD_PLANNER=$GLM53_OFFLOAD_PLANNER" \
     mindspeed-glm53-flash-env bash -lc '
 set -euo pipefail
@@ -145,7 +160,13 @@ export CPU_AFFINITY_CONF=1
 export MULTI_STREAM_MEMORY_REUSE=2
 export PYTHONPATH="$MS_ROOT:$MM_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 CONFIG="$RUN_DIR/config.yaml"
-python "$EXAMPLE_ROOT/render_config.py" --mode "$MODE" --base-dir "$ENV_ROOT" --output "$CONFIG" --disable-language-recompute "$GLM53_DISABLE_RECOMPUTE_LAYERS"
+PROFILE_ARGS=()
+if [[ -n "${GLM53_PROFILE_STEP:-}" ]]; then
+    PROFILE_ARGS=(--profile-step "$GLM53_PROFILE_STEP" --profile-save-path "$RUN_DIR/profiler")
+    mkdir -p "$RUN_DIR/profiler"
+fi
+python "$EXAMPLE_ROOT/render_config.py" --mode "$MODE" --base-dir "$ENV_ROOT" --output "$CONFIG" \
+    --disable-language-recompute "$GLM53_DISABLE_RECOMPUTE_LAYERS" "${PROFILE_ARGS[@]}"
 python "$EXAMPLE_ROOT/validate_runtime.py" --mode "$MODE" --config "$CONFIG" --disable-language-recompute "$GLM53_DISABLE_RECOMPUTE_LAYERS"
 cd "$MM_ROOT"
 if [[ "$RUNNER_MODE" == hyperoffload ]]; then

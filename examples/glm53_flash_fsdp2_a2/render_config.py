@@ -31,7 +31,14 @@ def main() -> None:
     parser.add_argument("--base-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--disable-language-recompute", default="0,3")
+    parser.add_argument("--profile-step", type=int)
+    parser.add_argument("--profile-save-path", type=Path)
     args = parser.parse_args()
+
+    if (args.profile_step is None) != (args.profile_save_path is None):
+        raise SystemExit("--profile-step and --profile-save-path must be provided together")
+    if args.profile_step is not None and args.profile_step < 1:
+        raise SystemExit("--profile-step is a one-based training iteration and must be >= 1")
 
     base_dir = args.base_dir.resolve()
     model_dir = base_dir / "model-assets" / PROXY_NAMES[args.mode]
@@ -85,6 +92,16 @@ def main() -> None:
             f"model.language_model.layers.{index}"
             for index in range(layer_count) if index not in disabled_layers
         ]
+    if args.profile_step is not None:
+        profile = config["tools"]["profile"]
+        profile["enable"] = True
+        # HyperOffload records its warmup guide on the first iteration.  Keep
+        # profiler-generated record_function events present in warmup and
+        # replay, otherwise enabling profiling only at the target step changes
+        # the replay operator sequence.
+        profile["static_param"]["start_step"] = 0
+        profile["static_param"]["end_step"] = args.profile_step
+        profile["static_param"]["save_path"] = str(args.profile_save_path.resolve())
     config["model"]["model_name_or_path"] = str(model_dir)
     dataset = config["data"]["dataset_param"]
     dataset["preprocess_parameters"]["model_name_or_path"] = str(model_dir)
@@ -110,6 +127,8 @@ def main() -> None:
         frozen_dataset["basic_parameters"]["dataset"] = str(dataset_path)
         if args.mode in ("partial_no_offload", "hyperoffload"):
             frozen["features"]["recompute_plan"]["apply_modules"] = config["features"]["recompute_plan"]["apply_modules"]
+        if args.profile_step is not None:
+            frozen["tools"]["profile"] = config["tools"]["profile"]
         if frozen != config:
             raise SystemExit("configuration differs from the accepted baseline beyond the selected recompute layers")
 
