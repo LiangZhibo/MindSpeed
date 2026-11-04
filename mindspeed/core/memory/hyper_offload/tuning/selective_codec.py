@@ -49,7 +49,7 @@ class FrozenNodeCodec:
         return getattr(self._backend, name)
 
 
-def codec_scopes(model, profiles, structure_key, *, device_headroom, host_headroom):
+def codec_scopes(model, profiles, structure_key, *, device_headroom, host_headroom, prior_origins=()):
     """Offer selective exposed-queue and reduced-traffic experiments.
 
     Capacity reserves worst-case packet memory for the entire selected scope,
@@ -71,10 +71,20 @@ def codec_scopes(model, profiles, structure_key, *, device_headroom, host_headro
         return (max(0., outbound[o.key].finish_ms-o.first_pressure_ms)
                 + max(0., inbound[o.key].finish_ms-o.needed_ms))
     scopes, known = [], set()
-    for purpose in ('exposed_queue', 'transfer_capacity'):
-        candidates = [o for o in eligible if purpose != 'exposed_queue' or exposure(o) > 0]
-        candidates.sort(key=lambda o: (-exposure(o) if purpose == 'exposed_queue' else
-            -o.candidate.size_bytes*(1.-indexed[o.candidate.size_bytes].packet_ratio), o.ready_ms))
+    purposes = ('profiled_anchor', 'exposed_queue', 'transfer_capacity') if prior_origins else ('exposed_queue', 'transfer_capacity')
+    for purpose in purposes:
+        if purpose == 'profiled_anchor':
+            # Storage identities and supported sizes come from this fresh
+            # capture. A stale or ambiguous prior never creates a codec node.
+            required = set(prior_origins)
+            candidates = [o for o in eligible if (o.candidate.copy_start.op_id, o.candidate.size_bytes) in required]
+            origins = {(o.candidate.copy_start.op_id, o.candidate.size_bytes) for o in candidates}
+            if origins != required or len(candidates) != len(required):
+                continue
+        else:
+            candidates = [o for o in eligible if purpose != 'exposed_queue' or exposure(o) > 0]
+            candidates.sort(key=lambda o: (-exposure(o) if purpose == 'exposed_queue' else
+                -o.candidate.size_bytes*(1.-indexed[o.candidate.size_bytes].packet_ratio), o.ready_ms))
         chosen, decoder_bytes, largest_encode, host_bytes = [], 0, 0, 4*1024**2
         for o in candidates:
             size = o.candidate.size_bytes
@@ -90,6 +100,8 @@ def codec_scopes(model, profiles, structure_key, *, device_headroom, host_headro
             decoder_bytes, largest_encode, host_bytes = proposed_decode, proposed_encode, proposed_host
         nodes = tuple(sorted((o.candidate.copy_start.op_id, 'post', o.candidate.storage_id,
                               o.candidate.size_bytes) for o in chosen))
+        if purpose == 'profiled_anchor' and len(chosen) != len(candidates):
+            continue
         if not nodes or nodes in known:
             continue
         known.add(nodes)

@@ -102,6 +102,8 @@ def parse_args():
     parser.add_argument("--offload-communication-masking", action="store_true")
     parser.add_argument("--hyper-offload-autotune", action="store_true")
     parser.add_argument("--offload-tuning-method", choices=("legacy", "measured", "explore"), default="measured")
+    parser.add_argument("--offload-device-window-profile",
+                        help="Graph-bound device timeline profile for whole-policy exploration")
     parser.add_argument("--offload-transfer-size-calibration", action="store_true",
                         help="Calibrate observed transfer sizes during bounded warmup")
     parser.add_argument("--offload-joint-refinement", action="store_true",
@@ -147,6 +149,8 @@ def parse_args():
     parser.add_argument("--use-torch-fsdp2", action="store_true", required=True)
     parser.add_argument("--fsdp2-config-path", required=True)
     args = parser.parse_args()
+    if args.offload_device_window_profile and not (args.hyper_offload_autotune and args.offload_tuning_method == 'explore'):
+        parser.error('--offload-device-window-profile requires automatic explore mode')
     if args.offload_tuning_steps is None:
         args.offload_tuning_steps = 40 if args.offload_tuning_method == 'explore' else 10
     if args.offload_tuning_candidates is None:
@@ -350,7 +354,9 @@ def main():
                     limits=limits, host_mb=args.offload_host_mb,
                     transfer_size_calibration=args.offload_transfer_size_calibration,
                     enable_compression=not args.offload_disable_compression,
-                    compression_library=args.offload_compression_library)
+                    compression_library=args.offload_compression_library,
+                    device_window_profile=(json.loads(Path(args.offload_device_window_profile).read_text())
+                                           if args.offload_device_window_profile else None))
             elif args.offload_tuning_method == 'measured':
                 if args.offload_region_layout == 'legacy_qwen':
                     raise ValueError('measured tuning requires an explicit gated or parallel_mlp structural adapter')

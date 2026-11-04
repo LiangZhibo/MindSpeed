@@ -34,6 +34,17 @@ def test_only_peak_crossing_supported_packet_sizes_can_enter_scope():
         assert not codec_scopes(model,profiles,(),device_headroom=10**8,host_headroom=10**8)
 
 
+def test_profiled_origin_is_resolved_again_on_the_current_peak_plan():
+    model = PeakWindowModel(trace())
+    def scopes(origins, profiles):
+        return codec_scopes(model, profiles, ("shape",), device_headroom=10**8,
+                            host_headroom=10**8, prior_origins=origins)
+    guided = scopes(((0, 100),), (profile(),))
+    assert guided[0].purpose == "profiled_anchor" and guided[0].nodes == ((0, "post", 0, 100),)
+    assert all(scope.purpose != "profiled_anchor" for scope in scopes(((1, 100),), (profile(),)))
+    assert not scopes(((0, 100),), (profile(size=200),))
+
+
 def test_capacity_uses_worst_case_device_and_full_new_host_bucket_not_ratio():
     model=PeakWindowModel(trace())
     wide=codec_scopes(model,(profile(ratio=.01),),(),device_headroom=10**8,host_headroom=10**8)[0]

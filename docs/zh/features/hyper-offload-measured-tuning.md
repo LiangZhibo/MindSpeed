@@ -11,6 +11,8 @@
 
 ## 全局容量驱动的探索入口
 
+已有参考图和硬件时间线时，也可以使用[基于 device 窗口的联合调优](hyper-offload-device-windows.md)。
+
 `mindspeed.core.memory.hyper_offload.tuning.exploration_session.ExplorationOffloadSession`
 接受相同的模型、区域适配器、容量和完整训练步观测。初始策略须采用命名区域和原始传输。
 

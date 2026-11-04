@@ -31,8 +31,13 @@ class JointPolicy:
     trim_after_offload: bool = False
     codec_key: str = "raw"
     trim_replay_interval: int = 1
+    shared_transfer_calendar: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.shared_transfer_calendar, bool):
+            raise ValueError('shared_transfer_calendar must be a boolean')
+        if self.shared_transfer_calendar and not self.masking:
+            raise ValueError('the shared transfer calendar requires communication masking')
         if (isinstance(self.trim_replay_interval, bool) or not isinstance(self.trim_replay_interval, int)
                 or self.trim_replay_interval < 1):
             raise ValueError('trim_replay_interval must be a positive integer')

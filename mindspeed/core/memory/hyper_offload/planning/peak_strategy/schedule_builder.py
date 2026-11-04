@@ -58,6 +58,12 @@ def build_schedule(context: ScheduleBuildContext) -> ResidencySchedule:
     """Materialize a schedule from selected gaps and action positions."""
     schedule = ResidencySchedule()
     ordered_candidates = order_selected_versions(context.selected_candidates)
+    if context.copy_positions:
+        for candidate in ordered_candidates:
+            origin = candidate.copy_start.op_id
+            position = context.copy_positions[candidate.selection_key]
+            if position != origin:
+                schedule.copy_origins[position, candidate.storage_id] = origin
     add_prefetch_actions(schedule, ordered_candidates, context.prefetch_positions)
     post_actions = collect_post_actions(ordered_candidates, context)
     add_deduplicated_post_actions(schedule, post_actions)
@@ -115,7 +121,8 @@ def collect_post_actions(
     order = 0
     for candidate in ordered_candidates:
         sid = candidate.storage_id
-        post_actions.append((candidate.copy_start.op_id, 10, order, ResidencyActionType.COPY_D2H, sid))
+        copy_at = (context.copy_positions or {}).get(candidate.selection_key, candidate.copy_start.op_id)
+        post_actions.append((copy_at, 10, order, ResidencyActionType.COPY_D2H, sid))
         order += 1
 
         post_actions.append(

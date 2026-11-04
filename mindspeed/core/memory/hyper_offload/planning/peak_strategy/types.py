@@ -180,6 +180,7 @@ class MaskingContext:
     transfer_window_scale: float | None = None
     limit_prefetch_window: bool = True
     transfer_cost_samples: tuple[tuple[int, float, float], ...] = ()
+    shared_transfer_calendar: bool = False
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,7 @@ class ScheduleBuildContext:
     prefetch_positions: dict[SelectionKey, int]
     releasable: dict[int, StorageAccess]
     retained_sids: set[int]
+    copy_positions: dict[SelectionKey, int] | None = None
 
 
 # Backward-compatible private names used by historical callers/tests.

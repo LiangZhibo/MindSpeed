@@ -42,7 +42,8 @@ class ExplorationOffloadSession(JointOffloadSession):
     """
     def __init__(self, initial, *, model, regions, limits, host_mb=65536,
                  process_group=None, transfer_size_calibration=True, beam_width=3,
-                 codecs=None, enable_compression=True, compression_library=None, calibration_limits=None):
+                 codecs=None, enable_compression=True, compression_library=None, calibration_limits=None,
+                 device_window_profile=None):
         if initial.recompute_regions is None or initial.codec_key != 'raw':
             raise ValueError('exploration requires named regions and an initial raw transport')
         if limits.device_peak_bytes is None or limits.max_steps > 60:
@@ -74,9 +75,24 @@ class ExplorationOffloadSession(JointOffloadSession):
         self.calibration_host_peak_bytes = 0
         limits = replace(limits, timing_noise_multiplier=1.0, validate_confirmation_timing=True,
                          confirm_best_observed=True)
-        self.neighborhood = CapacityFirstNeighborhood(self._evidence, beam_width=beam_width,
-            minimum_relative_gain=limits.minimum_relative_gain,
-            timing_noise_multiplier=limits.timing_noise_multiplier)
+        options = dict(beam_width=beam_width, minimum_relative_gain=limits.minimum_relative_gain,
+                       timing_noise_multiplier=limits.timing_noise_multiplier)
+        if device_window_profile is None:
+            self.neighborhood = CapacityFirstNeighborhood(self._evidence, **options)
+        else:
+            from .device_windows import DeviceWindowProfile
+            from .device_window_search import DeviceWindowNeighborhood
+            profile = DeviceWindowProfile(device_window_profile)
+            if profile.device_mb != initial.resident_mb:
+                raise ValueError('profile managed-memory budget differs from this run')
+            required_names = set(profile.recompute + profile.resident) | {r.name for r in profile.groups}
+            if not required_names <= set(regions.names):
+                raise ValueError('profile anchor contains unregistered regions')
+            initial = replace(initial, recompute_regions=profile.recompute, resident_regions=profile.resident,
+                              transfer_window_scale=profile.window_scale,
+                              shared_transfer_calendar=profile.prefer_shared_calendar)
+            self.initial_policy = initial
+            self.neighborhood = DeviceWindowNeighborhood(self._evidence, profile, **options)
         controller = JointTuningController(initial, self._propose, limits,
                                           search_time_reducer=self._synchronize_search_seconds)
         super().__init__(controller, apply_policy=regions.apply_policy, host_mb=host_mb,
@@ -259,6 +275,12 @@ class ExplorationOffloadSession(JointOffloadSession):
                 dist.all_gather_object(reports, report, group=self.process_group)
             self._global_reports[key] = merge_phase_reports(reports)
             self.global_phase_report = self._global_reports[key]
+            profile = getattr(self.neighborhood, 'profile', None)
+            if profile is not None and key == self.initial_policy.structure_key and (
+                    self.global_phase_report is None
+                    or self.global_phase_report['trace_signature'] != profile.signature
+                    or self.global_phase_report['capacity_summary']['op_count'] != profile.op_count):
+                raise ValueError('device-window anchor does not match this training trace on all ranks')
             self.proposal_consensus_seconds += time.perf_counter() - started
             if rank == 0 and key not in self._queue_models and trial.policy in self._plans:
                 started = time.perf_counter()
@@ -279,6 +301,7 @@ class ExplorationOffloadSession(JointOffloadSession):
                     and self._global_reports[key] is not None):
                 host_limit = self.controller.limits.host_peak_bytes
                 scopes = codec_scopes(self._queue_models[key][0], self._codec_profiles, key,
+                    prior_origins=profile.codec_origins if profile is not None and key == self.initial_policy.structure_key else (),
                     device_headroom=max(0, self.controller.limits.device_peak_bytes-trial.device_peak_bytes),
                     host_headroom=max(0, (host_limit if host_limit is not None else self._host_limit_bytes)-trial.host_peak_bytes))
                 self._auto_scopes.update((scope.key, scope) for scope in scopes)
